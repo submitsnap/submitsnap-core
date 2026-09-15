@@ -1,8 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
 use uuid::Uuid;
 use validator::Validate;
+
+use crate::modules::auth::repository::UserRecord;
 
 #[derive(Debug, Deserialize, Validate)]
 pub struct RegisterRequest {
@@ -18,14 +19,6 @@ pub struct LoginRequest {
     pub email: String,
     #[validate(length(min = 1, max = 128))]
     pub password: String,
-}
-
-#[derive(Debug, FromRow)]
-pub struct UserRecord {
-    pub id: Uuid,
-    pub email: String,
-    pub password_hash: String,
-    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]

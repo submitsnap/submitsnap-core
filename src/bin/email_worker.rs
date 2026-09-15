@@ -1,4 +1,4 @@
-use submitsnap_core::{config::AppConfig, email::EmailClient, queue::EmailQueue};
+use submitsnap_core::shared::{config::AppConfig, email::EmailClient, queue::EmailQueue};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
-use sqlx::postgres::PgPoolOptions;
-use submitsnap_core::{app, config::AppConfig, queue::EmailQueue, state::AppState};
+use submitsnap_core::{
+    app,
+    shared::{config::AppConfig, db, queue::EmailQueue, state::AppState},
+};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -11,10 +13,7 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let config = AppConfig::from_env()?;
-    let database = PgPoolOptions::new()
-        .max_connections(config.database_max_connections)
-        .connect(&config.database_url)
-        .await?;
+    let database = db::connect(&config).await?;
     let queue = EmailQueue::connect(&config.redis_url)?;
     let state = AppState::new(Arc::new(config), database, queue);
     let bind_address = state.config.bind_address()?;

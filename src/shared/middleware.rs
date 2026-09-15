@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::state::AppState;
+use crate::shared::state::AppState;
 
 pub async fn rate_limit(
     State(state): State<AppState>,

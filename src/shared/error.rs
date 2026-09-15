@@ -5,6 +5,7 @@ use axum::{
 };
 use serde::Serialize;
 use thiserror::Error;
+use validator::Validate;
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -39,4 +40,10 @@ impl IntoResponse for AppError {
         };
         (status, Json(ErrorBody { error: &message })).into_response()
     }
+}
+
+pub fn validate<T: Validate>(value: &T) -> Result<(), AppError> {
+    value
+        .validate()
+        .map_err(|errors| AppError::Validation(errors.to_string()))
 }
