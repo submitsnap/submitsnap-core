@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -33,6 +34,11 @@ pub struct Registration {
     pub user: PublicUser,
     pub verification_token: String,
 }
+
+/// How many times handing a message to the queue is attempted before giving up.
+const EMAIL_ENQUEUE_ATTEMPTS: u32 = 3;
+/// First retry delay; each subsequent retry doubles it.
+const EMAIL_ENQUEUE_BASE_DELAY_MS: u64 = 50;
 
 #[derive(Clone)]
 pub struct IdentityService {
@@ -425,6 +431,42 @@ impl IdentityService {
         Ok((public, total))
     }
 
+    /// Changes an account's status. Disabling also signs the account out everywhere, because
+    /// this is normally a response to abuse rather than a routine edit.
+    pub async fn set_account_status(
+        &self,
+        target_id: Uuid,
+        status: UserStatus,
+        client: &ClientInfo,
+    ) -> Result<PublicUser, IdentityError> {
+        if !self.users.set_status(target_id, status).await? {
+            return Err(IdentityError::NotFound);
+        }
+
+        if status == UserStatus::Disabled {
+            self.sessions
+                .revoke_all_for_user(target_id)
+                .await
+                .map_err(IdentityError::Internal)?;
+        }
+
+        let user = self
+            .users
+            .find_by_id(target_id)
+            .await?
+            .ok_or(IdentityError::NotFound)?;
+
+        self.record(
+            AuthEventType::AccountStatusChanged,
+            Some(target_id),
+            Some(&user.email),
+            client,
+        )
+        .await;
+
+        self.public_user(&user).await
+    }
+
     /// Issues (and emails) a fresh verification link, invalidating any outstanding one.
     /// The raw token is returned to the caller for dispatch and must not be exposed.
     async fn issue_email_verification(
@@ -515,6 +557,10 @@ impl IdentityService {
         }
     }
 
+    /// Hands a message to the queue, retrying a couple of times so a brief broker blip does
+    /// not lose a verification link. The operation that triggered the mail must not fail
+    /// because of it, so an exhausted retry is logged rather than returned; the recipient can
+    /// always ask for another link. Never logs the message body, which carries the token.
     async fn enqueue_email(&self, to: &str, subject: &str, body: &str) {
         let job = EmailJob {
             to: to.to_owned(),
@@ -522,9 +568,21 @@ impl IdentityService {
             text_body: body.to_owned(),
         };
 
-        if let Err(error) = self.queue.enqueue(&job).await {
-            // Delivery problems must not fail the operation the user asked for.
-            tracing::error!(error = ?error, "failed to enqueue email");
+        for attempt in 1..=EMAIL_ENQUEUE_ATTEMPTS {
+            match self.queue.enqueue(&job).await {
+                Ok(()) => return,
+                Err(error) if attempt == EMAIL_ENQUEUE_ATTEMPTS => {
+                    tracing::error!(
+                        error = ?error,
+                        attempts = attempt,
+                        "failed to enqueue email; the recipient must request another link"
+                    );
+                }
+                Err(_) => {
+                    let backoff = EMAIL_ENQUEUE_BASE_DELAY_MS * 2u64.pow(attempt - 1);
+                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                }
+            }
         }
     }
 

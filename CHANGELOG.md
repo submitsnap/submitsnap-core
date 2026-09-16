@@ -21,6 +21,11 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 - OpenAPI 3 document and Swagger UI served from `/docs`, with bearer and cookie security schemes.
 - Configuration for token lifetimes, lockout policy, an optional password pepper, CORS origins, HTTP body and timeout limits, and the application base URL used in emails.
 - `Makefile` wrapping the local workflow: service lifecycle, migration and reset targets, running the API and worker, and the lint and test gates.
+- `PATCH /admin/users/{id}/status` so an administrator can disable or re-enable an account; disabling revokes its sessions.
+- `SMTP_TLS_MODE` selecting STARTTLS, implicit TLS, or plaintext for the SMTP connection.
+- `check_email` binary and `make check-email`, which send one message so SMTP settings can be validated without going through registration.
+- Startup validation that rejects placeholder `JWT_SECRET` values and incomplete SMTP configuration, plus warnings for settings that are unsafe on a non-loopback address.
+- Retry with backoff when handing a message to the email queue, so a transient broker failure does not lose a verification link.
 
 ### Changed
 
@@ -31,6 +36,11 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 - Email addresses are normalized as they are deserialized, so validation, storage, and lookup always see the same form.
 - Local Compose ports now map to the ports PostgreSQL and Redis actually listen on.
 - Error responses carry a stable machine-readable `code` alongside the human-readable message.
+- Password hashes are re-encoded on successful sign-in when the Argon2 parameters have changed.
+
+### Removed
+
+- Resend and Postmark email providers. Delivery now goes through SMTP only, so no third-party account is required.
 
 ### Security
 
@@ -42,3 +52,5 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 - Credentials are wrapped in a redacting secret type so they cannot leak through debug output.
 - Passwords use explicit Argon2id parameters with an optional server-side pepper, and hashes are upgraded on sign-in when the parameters change.
 - Authentication responses are marked `Cache-Control: no-store`; security headers, request body limits, and request timeouts apply to the whole service.
+- The service refuses to start with a documented placeholder signing key, which a copied deployment would otherwise run with.
+

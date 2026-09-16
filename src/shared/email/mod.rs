@@ -1,59 +1,69 @@
-mod http;
-
 use std::str::FromStr;
 
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor, message::Mailbox,
     transport::smtp::authentication::Credentials,
 };
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 
 use crate::shared::{config::EmailConfig, queue::EmailJob};
 
-use self::http::{HttpEmailClient, HttpProvider};
+/// How the SMTP connection is protected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmtpTls {
+    /// Connect in the clear, then upgrade the connection with STARTTLS. The usual choice for
+    /// port 587 and what most self-hosted servers expect.
+    StartTls,
+    /// TLS from the first byte, as used by port 465.
+    Implicit,
+    /// No encryption. Credentials and message bodies travel in the clear.
+    None,
+}
+
+impl FromStr for SmtpTls {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "starttls" => Ok(Self::StartTls),
+            "implicit" | "tls" => Ok(Self::Implicit),
+            "none" => Ok(Self::None),
+            other => {
+                anyhow::bail!(
+                    "unsupported SMTP_TLS_MODE {other:?}; use starttls, implicit, or none"
+                )
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub enum EmailClient {
+    /// Accepts messages and drops them. The default, so a development checkout never sends
+    /// mail by accident.
     Disabled,
-    Smtp {
-        client: AsyncSmtpTransport<Tokio1Executor>,
-        from: Mailbox,
-    },
-    Resend(HttpEmailClient),
-    Postmark(HttpEmailClient),
+    Smtp(Box<SmtpSender>),
+}
+
+/// The SMTP transport plus the envelope sender. Boxed because the transport is an order of
+/// magnitude larger than the disabled variant.
+#[derive(Clone)]
+pub struct SmtpSender {
+    client: AsyncSmtpTransport<Tokio1Executor>,
+    from: Mailbox,
 }
 
 impl EmailClient {
     pub fn from_config(config: &EmailConfig) -> anyhow::Result<Self> {
-        match config.email_provider.as_str() {
+        match config.email_provider.trim().to_ascii_lowercase().as_str() {
             "disabled" => Ok(Self::Disabled),
-            "smtp" => {
-                let host = required(&config.smtp_host, "SMTP_HOST")?;
-                let from = Mailbox::from_str(required(&config.email_from, "EMAIL_FROM")?)?;
-                let mut builder = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)?;
-                builder = builder.port(config.smtp_port);
-                if let (Some(username), Some(password)) =
-                    (&config.smtp_username, &config.smtp_password)
-                {
-                    builder = builder.credentials(Credentials::new(
-                        username.clone(),
-                        password.expose_secret().to_owned(),
-                    ));
-                }
-                Ok(Self::Smtp {
-                    client: builder.build(),
-                    from,
-                })
-            }
-            "resend" => Ok(Self::Resend(HttpEmailClient::new(
-                config,
-                HttpProvider::Resend,
-            )?)),
-            "postmark" => Ok(Self::Postmark(HttpEmailClient::new(
-                config,
-                HttpProvider::Postmark,
-            )?)),
-            provider => anyhow::bail!("unsupported EMAIL_PROVIDER: {provider}"),
+            "smtp" => Ok(Self::Smtp(Box::new(SmtpSender {
+                client: smtp_transport(config)?,
+                from: Mailbox::from_str(required(&config.email_from, "EMAIL_FROM")?)?,
+            }))),
+            other => anyhow::bail!(
+                "unsupported EMAIL_PROVIDER {other:?}; supported values are disabled and smtp"
+            ),
         }
     }
 
@@ -63,31 +73,155 @@ impl EmailClient {
                 tracing::warn!(recipient = %job.to, "email provider disabled; message was not delivered");
                 Ok(())
             }
-            Self::Smtp { client, from } => {
+            Self::Smtp(sender) => {
                 let message = Message::builder()
-                    .from(from.clone())
+                    .from(sender.from.clone())
                     .to(Mailbox::from_str(&job.to)?)
                     .subject(&job.subject)
                     .body(job.text_body.clone())?;
-                client.send(message).await?;
+
+                sender.client.send(message).await?;
                 Ok(())
             }
-            Self::Resend(client) | Self::Postmark(client) => client.send(job).await,
         }
     }
+}
+
+fn smtp_transport(config: &EmailConfig) -> anyhow::Result<AsyncSmtpTransport<Tokio1Executor>> {
+    let host = required(&config.smtp_host, "SMTP_HOST")?;
+    let tls = SmtpTls::from_str(&config.smtp_tls_mode)?;
+
+    let mut builder = match tls {
+        SmtpTls::StartTls => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)?,
+        SmtpTls::Implicit => AsyncSmtpTransport::<Tokio1Executor>::relay(host)?,
+        SmtpTls::None => {
+            tracing::warn!(
+                "SMTP_TLS_MODE=none: credentials and message bodies will be sent unencrypted"
+            );
+            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host)
+        }
+    };
+
+    builder = builder.port(config.smtp_port);
+
+    if let (Some(username), Some(password)) = (&config.smtp_username, &config.smtp_password) {
+        builder = builder.credentials(Credentials::new(
+            username.clone(),
+            password.expose_secret().to_owned(),
+        ));
+    }
+
+    Ok(builder.build())
 }
 
 fn required<'a>(value: &'a Option<String>, setting: &str) -> anyhow::Result<&'a str> {
     value
         .as_deref()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{setting} is required"))
+        .ok_or_else(|| anyhow::anyhow!("{setting} is required when EMAIL_PROVIDER=smtp"))
 }
 
-fn required_secret<'a>(value: &'a Option<SecretString>, setting: &str) -> anyhow::Result<&'a str> {
-    value
-        .as_ref()
-        .map(|secret| secret.expose_secret())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{setting} is required"))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secrecy::SecretString;
+
+    fn smtp_config() -> EmailConfig {
+        EmailConfig {
+            email_provider: "smtp".into(),
+            smtp_host: Some("smtp.example.com".into()),
+            smtp_port: 587,
+            smtp_username: Some("mailer".into()),
+            smtp_password: Some(SecretString::from("hunter2".to_owned())),
+            email_from: Some("hello@example.com".into()),
+            smtp_tls_mode: "starttls".into(),
+        }
+    }
+
+    #[test]
+    fn disabled_needs_no_further_configuration() {
+        let config = EmailConfig {
+            email_provider: "disabled".into(),
+            smtp_host: None,
+            smtp_port: 587,
+            smtp_username: None,
+            smtp_password: None,
+            email_from: None,
+            smtp_tls_mode: "starttls".into(),
+        };
+
+        assert!(matches!(
+            EmailClient::from_config(&config).unwrap(),
+            EmailClient::Disabled
+        ));
+    }
+
+    #[test]
+    fn smtp_requires_a_host() {
+        let config = EmailConfig {
+            smtp_host: None,
+            ..smtp_config()
+        };
+
+        let error = EmailClient::from_config(&config)
+            .err()
+            .expect("expected an error")
+            .to_string();
+        assert!(error.contains("SMTP_HOST"), "{error}");
+    }
+
+    #[test]
+    fn smtp_requires_a_sender() {
+        let config = EmailConfig {
+            email_from: None,
+            ..smtp_config()
+        };
+
+        let error = EmailClient::from_config(&config)
+            .err()
+            .expect("expected an error")
+            .to_string();
+        assert!(error.contains("EMAIL_FROM"), "{error}");
+    }
+
+    #[test]
+    fn unsupported_providers_name_the_valid_values() {
+        let config = EmailConfig {
+            email_provider: "resend".into(),
+            ..smtp_config()
+        };
+
+        let error = EmailClient::from_config(&config)
+            .err()
+            .expect("expected an error")
+            .to_string();
+        assert!(error.contains("disabled and smtp"), "{error}");
+    }
+
+    #[test]
+    fn tls_modes_are_parsed_and_unknown_values_rejected() {
+        assert_eq!("starttls".parse::<SmtpTls>().unwrap(), SmtpTls::StartTls);
+        assert_eq!("IMPLICIT".parse::<SmtpTls>().unwrap(), SmtpTls::Implicit);
+        assert_eq!("tls".parse::<SmtpTls>().unwrap(), SmtpTls::Implicit);
+        assert_eq!("none".parse::<SmtpTls>().unwrap(), SmtpTls::None);
+        assert!("ssl".parse::<SmtpTls>().is_err());
+    }
+
+    #[test]
+    fn every_tls_mode_builds_a_client() {
+        for mode in ["starttls", "implicit", "none"] {
+            let config = EmailConfig {
+                smtp_tls_mode: mode.into(),
+                ..smtp_config()
+            };
+
+            assert!(
+                matches!(
+                    EmailClient::from_config(&config).unwrap(),
+                    EmailClient::Smtp(_)
+                ),
+                "mode {mode} should build an SMTP client"
+            );
+        }
+    }
 }

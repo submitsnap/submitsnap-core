@@ -1,7 +1,10 @@
 mod common;
 
 use axum::http::{Method, StatusCode};
-use common::{PASSWORD, TestApp, access_token, cookie_header, cookie_request, read, refresh_token};
+use common::{
+    PASSWORD, TestApp, access_token, cookie_header, cookie_request, grant_admin_role, preflight,
+    read, refresh_token, user_id,
+};
 use serde_json::json;
 use sqlx::PgPool;
 
@@ -322,13 +325,7 @@ async fn admin_routes_require_the_admin_role(pool: PgPool) {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["code"], "forbidden");
 
-    sqlx::query(
-        "INSERT INTO user_roles (user_id, role_id) SELECT $1, id FROM roles WHERE name = 'admin'",
-    )
-    .bind(common::user_id(&user))
-    .execute(&pool)
-    .await
-    .expect("role is granted");
+    grant_admin_role(&pool, user_id(&user)).await;
 
     let (status, body) = app.get_auth("/api/v1/admin/users", &token).await;
     assert_eq!(status, StatusCode::OK);
@@ -343,13 +340,7 @@ async fn admin_pagination_is_bounded(pool: PgPool) {
     let (_, user) = app.register("person@example.com", PASSWORD).await;
     let (_, session) = app.login("person@example.com", PASSWORD).await;
 
-    sqlx::query(
-        "INSERT INTO user_roles (user_id, role_id) SELECT $1, id FROM roles WHERE name = 'admin'",
-    )
-    .bind(common::user_id(&user))
-    .execute(&pool)
-    .await
-    .expect("role is granted");
+    grant_admin_role(&pool, user_id(&user)).await;
 
     let (status, _) = app
         .get_auth(
@@ -396,4 +387,226 @@ async fn auth_responses_are_not_cacheable(pool: PgPool) {
             .and_then(|value| value.to_str().ok()),
         Some("no-store")
     );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn administrators_can_disable_and_reenable_accounts(pool: PgPool) {
+    let app = TestApp::new(pool.clone());
+
+    let (_, admin) = app.register("admin@example.com", PASSWORD).await;
+    grant_admin_role(&pool, user_id(&admin)).await;
+    let (_, admin_session) = app.login("admin@example.com", PASSWORD).await;
+    let admin_token = access_token(&admin_session);
+
+    let (_, target) = app.register("target@example.com", PASSWORD).await;
+    let target_id = user_id(&target);
+    let (_, target_session) = app.login("target@example.com", PASSWORD).await;
+    let target_token = access_token(&target_session);
+
+    // A normal account cannot change anyone's status.
+    let (status, _) = app
+        .patch_json_auth(
+            &format!("/api/v1/admin/users/{}/status", user_id(&admin)),
+            json!({ "status": "disabled" }),
+            &target_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Unknown accounts are reported honestly rather than silently ignored.
+    let (status, body) = app
+        .patch_json_auth(
+            &format!("/api/v1/admin/users/{}/status", uuid::Uuid::new_v4()),
+            json!({ "status": "disabled" }),
+            &admin_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "not_found");
+
+    let target_status = format!("/api/v1/admin/users/{target_id}/status");
+
+    // Disabling takes effect immediately for the target's live session.
+    let (status, body) = app
+        .patch_json_auth(
+            &target_status,
+            json!({ "status": "disabled" }),
+            &admin_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "disabled");
+    assert_eq!(
+        app.get_auth("/api/v1/auth/me", &target_token).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let (status, body) = app.login("target@example.com", PASSWORD).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "forbidden");
+
+    // Re-enabling restores access.
+    let (status, body) = app
+        .patch_json_auth(&target_status, json!({ "status": "active" }), &admin_token)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "active");
+    assert_eq!(
+        app.login("target@example.com", PASSWORD).await.0,
+        StatusCode::OK
+    );
+
+    // An administrator cannot lock themselves out of the instance.
+    let (status, _) = app
+        .patch_json_auth(
+            &format!("/api/v1/admin/users/{}/status", user_id(&admin)),
+            json!({ "status": "disabled" }),
+            &admin_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // `pending` is assigned by the system, never chosen by an operator, so it is not accepted.
+    // 422 is the rejection axum produces for a body that parses but does not fit the schema.
+    let (status, _) = app
+        .patch_json_auth(&target_status, json!({ "status": "pending" }), &admin_token)
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn outdated_password_hashes_are_upgraded_on_sign_in(pool: PgPool) {
+    let app = TestApp::new(pool.clone());
+    let (_, user) = app.register("person@example.com", PASSWORD).await;
+    let id = user_id(&user);
+
+    let outdated = outdated_password_hash(PASSWORD);
+    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+        .bind(id)
+        .bind(&outdated)
+        .execute(&pool)
+        .await
+        .expect("the stored hash is replaced");
+
+    // The old hash still authenticates, and is quietly re-encoded with current parameters.
+    assert_eq!(
+        app.login("person@example.com", PASSWORD).await.0,
+        StatusCode::OK
+    );
+
+    let stored: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("the hash is readable");
+
+    assert_ne!(
+        stored, outdated,
+        "sign-in should re-encode the hash with the current parameters"
+    );
+    assert_eq!(
+        app.login("person@example.com", PASSWORD).await.0,
+        StatusCode::OK
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_configured_pepper_is_required_to_sign_in(pool: PgPool) {
+    let app = TestApp::with_config(
+        vec![("password_pepper", "a-server-side-pepper-value".to_owned())],
+        pool.clone(),
+    );
+    app.register("person@example.com", PASSWORD).await;
+
+    assert_eq!(
+        app.login("person@example.com", PASSWORD).await.0,
+        StatusCode::OK
+    );
+
+    // Rotating the pepper invalidates stored hashes, which proves it really is mixed in.
+    let rotated = TestApp::with_config(
+        vec![(
+            "password_pepper",
+            "a-completely-different-pepper-value".to_owned(),
+        )],
+        pool,
+    );
+    assert_eq!(
+        rotated.login("person@example.com", PASSWORD).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cors_only_allows_configured_origins(pool: PgPool) {
+    let configured = TestApp::with_config(
+        vec![("cors_allowed_origins", "https://app.example.com".to_owned())],
+        pool.clone(),
+    );
+
+    let allowed = configured.send(preflight("https://app.example.com")).await;
+    assert_eq!(
+        allowed
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("https://app.example.com")
+    );
+    assert_eq!(
+        allowed
+            .headers()
+            .get("access-control-allow-credentials")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+
+    let denied = configured.send(preflight("https://evil.example.com")).await;
+    assert!(
+        denied
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none(),
+        "an origin outside the allowlist must not be echoed back"
+    );
+
+    // With no allowlist configured, CORS is off entirely.
+    let unconfigured = TestApp::new(pool);
+    let closed = unconfigured
+        .send(preflight("https://app.example.com"))
+        .await;
+    assert!(
+        closed
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none()
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn registration_survives_an_unreachable_email_queue(pool: PgPool) {
+    // The harness points Redis at a closed port, so the enqueue is retried and then reported.
+    // Losing the message must not cost the user the account they just created.
+    let app = TestApp::new(pool);
+
+    let (status, user) = app.register("person@example.com", PASSWORD).await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(user["email"], "person@example.com");
+}
+
+/// Produces an Argon2id hash using parameters weaker than the ones the service now uses,
+/// standing in for a hash stored before the parameters were raised.
+fn outdated_password_hash(password: &str) -> String {
+    use argon2::{
+        Algorithm, Argon2, Params, Version,
+        password_hash::{PasswordHasher, SaltString, rand_core::OsRng},
+    };
+
+    let params = Params::new(8 * 1024, 1, 1, None).expect("test parameters are valid");
+    let salt = SaltString::generate(&mut OsRng);
+
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+        .hash_password(password.as_bytes(), &salt)
+        .expect("hashing succeeds")
+        .to_string()
 }

@@ -22,7 +22,7 @@ endif
 .DEFAULT_GOAL := help
 
 .PHONY: help up down logs check-sqlx db-create migrate db-reset bootstrap \
-        run worker build fmt lint test-unit test ci clean
+        run worker check-email build fmt lint test-unit test ci clean
 
 help: ## List the available targets
 	@printf 'SubmitSnap Core\n\nUsage: make <target>\n\nTargets:\n'
@@ -70,6 +70,12 @@ run: ## Run the API server
 
 worker: ## Run the email worker
 	$(CARGO) run --bin email_worker
+
+check-email: ## Send one test message through the configured SMTP server (TO=you@example.com)
+	@test -n '$(TO)' || { \
+		printf '\033[31mSet TO=<recipient>:\033[0m make check-email TO=you@example.com\n'; \
+		exit 1; }
+	$(CARGO) run --bin check_email -- '$(TO)'
 
 build: ## Build the release binaries
 	$(CARGO) build --release

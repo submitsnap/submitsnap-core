@@ -121,6 +121,19 @@ impl TestApp {
         .await
     }
 
+    pub async fn patch_json_auth(
+        &self,
+        path: &str,
+        body: Value,
+        token: &str,
+    ) -> (StatusCode, Value) {
+        read(
+            self.send(json_request(Method::PATCH, path, Some(body), Some(token)))
+                .await,
+        )
+        .await
+    }
+
     pub async fn get_auth(&self, path: &str, token: &str) -> (StatusCode, Value) {
         read(
             self.send(json_request(Method::GET, path, None, Some(token)))
@@ -191,6 +204,31 @@ pub fn cookie_request(
         .header(header::COOKIE, cookie)
         .extension(ConnectInfo(SocketAddr::new(TEST_IP, 12345)))
         .body(body)
+        .expect("request builds")
+}
+
+/// Grants the administrator role directly, since there is deliberately no API that hands out
+/// roles to unauthenticated callers.
+pub async fn grant_admin_role(pool: &PgPool, user_id: uuid::Uuid) {
+    sqlx::query(
+        "INSERT INTO user_roles (user_id, role_id) SELECT $1, id FROM roles WHERE name = 'admin'",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("admin role is granted");
+}
+
+/// A CORS preflight request, used to check the allowed-origin behaviour.
+pub fn preflight(origin: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/api/v1/auth/login")
+        .header(header::ORIGIN, origin)
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+        .extension(ConnectInfo(SocketAddr::new(TEST_IP, 12345)))
+        .body(Body::empty())
         .expect("request builds")
 }
 

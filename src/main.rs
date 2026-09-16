@@ -13,6 +13,7 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let config = AppConfig::from_env()?;
+    config.log_deployment_warnings();
     let database = db::connect(&config).await?;
     let queue = EmailQueue::connect(&config.redis_url)?;
     let state = AppState::new(Arc::new(config), database, queue);

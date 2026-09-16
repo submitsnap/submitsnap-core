@@ -192,6 +192,19 @@ impl UserRepository {
 
         Ok(())
     }
+
+    /// Applies an administrative status change. Returns `false` when no such account exists,
+    /// so the caller can answer with a 404 instead of pretending it worked.
+    pub async fn set_status(&self, id: Uuid, status: UserStatus) -> Result<bool, IdentityError> {
+        let outcome = sqlx::query("UPDATE users SET status = $2 WHERE id = $1")
+            .bind(id)
+            .bind(status)
+            .execute(&self.database)
+            .await
+            .map_err(internal)?;
+
+        Ok(outcome.rows_affected() > 0)
+    }
 }
 
 fn internal(error: sqlx::Error) -> IdentityError {

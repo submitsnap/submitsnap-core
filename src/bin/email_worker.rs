@@ -13,6 +13,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = AppConfig::from_env()?;
+    config.log_deployment_warnings();
     let queue = EmailQueue::connect(&config.redis_url)?;
     let email = EmailClient::from_config(&config.email_settings())?;
     info!("email worker started");

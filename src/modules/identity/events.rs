@@ -18,6 +18,7 @@ pub enum AuthEventType {
     PasswordResetRequested,
     PasswordResetCompleted,
     PasswordChanged,
+    AccountStatusChanged,
 }
 
 /// An audit record to append. Borrowed fields keep the call sites cheap.

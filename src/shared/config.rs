@@ -74,10 +74,9 @@ pub struct AppConfig {
     pub smtp_password: Option<SecretString>,
     #[serde(default)]
     pub email_from: Option<String>,
-    #[serde(default)]
-    pub email_api_token: Option<SecretString>,
-    #[serde(default)]
-    pub email_api_base_url: Option<String>,
+    /// `starttls` (port 587), `implicit` (port 465), or `none`.
+    #[serde(default = "default_smtp_tls_mode")]
+    pub smtp_tls_mode: String,
 }
 
 /// The subset of configuration the email adapters require. Plain data: it is derived from
@@ -90,8 +89,7 @@ pub struct EmailConfig {
     pub smtp_username: Option<String>,
     pub smtp_password: Option<SecretString>,
     pub email_from: Option<String>,
-    pub email_api_token: Option<SecretString>,
-    pub email_api_base_url: Option<String>,
+    pub smtp_tls_mode: String,
 }
 
 impl AppConfig {
@@ -118,6 +116,12 @@ impl AppConfig {
 
         if self.jwt_secret.expose_secret().len() < 32 {
             invalid.push("JWT_SECRET must be at least 32 characters long");
+        }
+        if is_placeholder_secret(self.jwt_secret.expose_secret()) {
+            invalid.push(
+                "JWT_SECRET is still a placeholder value; generate one with \
+                 `openssl rand -base64 48` and keep it secret",
+            );
         }
         if self.rate_limit_per_minute == 0 {
             invalid.push("RATE_LIMIT_PER_MINUTE must be greater than zero");
@@ -159,6 +163,22 @@ impl AppConfig {
             invalid.push("ACCESS_TOKEN_TTL_SECONDS must be shorter than REFRESH_TOKEN_TTL_SECONDS");
         }
 
+        // Fail at startup rather than at the first verification email.
+        if self.uses_smtp() {
+            if self.smtp_host.as_deref().is_none_or(str::is_empty) {
+                invalid.push("SMTP_HOST is required when EMAIL_PROVIDER=smtp");
+            }
+            if self.email_from.as_deref().is_none_or(str::is_empty) {
+                invalid.push("EMAIL_FROM is required when EMAIL_PROVIDER=smtp");
+            }
+        }
+        if !matches!(
+            self.smtp_tls_mode.trim().to_ascii_lowercase().as_str(),
+            "starttls" | "implicit" | "tls" | "none"
+        ) {
+            invalid.push("SMTP_TLS_MODE must be starttls, implicit, or none");
+        }
+
         if invalid.is_empty() {
             return Ok(());
         }
@@ -180,8 +200,7 @@ impl AppConfig {
             smtp_username: self.smtp_username.clone(),
             smtp_password: self.smtp_password.clone(),
             email_from: self.email_from.clone(),
-            email_api_token: self.email_api_token.clone(),
-            email_api_base_url: self.email_api_base_url.clone(),
+            smtp_tls_mode: self.smtp_tls_mode.clone(),
         }
     }
 
@@ -197,6 +216,91 @@ impl AppConfig {
             .collect();
         (!origins.is_empty()).then_some(origins)
     }
+
+    pub fn uses_smtp(&self) -> bool {
+        self.email_provider.trim().eq_ignore_ascii_case("smtp")
+    }
+
+    /// Emits [`Self::deployment_warnings`] through the tracing subscriber. Never fails: a
+    /// warning must not stop a deployment the operator chose on purpose.
+    pub fn log_deployment_warnings(&self) {
+        for warning in self.deployment_warnings() {
+            tracing::warn!(target: "submitsnap_core::config", "{warning}");
+        }
+    }
+
+    /// Whether the service is bound to an address only reachable from this host. Used to
+    /// decide how loudly to warn about development-friendly settings.
+    pub fn is_loopback_only(&self) -> bool {
+        matches!(
+            self.server_host.trim(),
+            "127.0.0.1" | "localhost" | "::1" | "[::1]"
+        )
+    }
+
+    /// Settings that are fine locally but risky in production. Logged at startup so a
+    /// misconfigured deployment is obvious from its own logs, without refusing to boot.
+    pub fn deployment_warnings(&self) -> Vec<String> {
+        if self.is_loopback_only() {
+            return Vec::new();
+        }
+
+        let mut warnings = Vec::new();
+
+        if !self.cookie_secure {
+            warnings.push(
+                "COOKIE_SECURE=false while serving a non-loopback address: session cookies \
+                 will travel over plain HTTP"
+                    .into(),
+            );
+        }
+        if self.api_docs_enabled {
+            warnings.push(
+                "API_DOCS_ENABLED=true while serving a non-loopback address: the endpoint \
+                 list is publicly readable"
+                    .into(),
+            );
+        }
+        if !self.require_email_verification {
+            warnings.push(
+                "REQUIRE_EMAIL_VERIFICATION=false: unverified email addresses can sign in".into(),
+            );
+        }
+        if self.email_provider.trim().eq_ignore_ascii_case("disabled") {
+            warnings.push(
+                "EMAIL_PROVIDER=disabled: verification and password reset messages are \
+                 discarded, so nobody can recover an account"
+                    .into(),
+            );
+        }
+        if self.password_pepper.is_none() {
+            warnings.push(
+                "PASSWORD_PEPPER is unset: a database disclosure alone would be enough to \
+                 attack password hashes offline"
+                    .into(),
+            );
+        }
+
+        warnings
+    }
+}
+
+/// Well-known values people copy from documentation or compose files and then forget to
+/// replace. Rejecting them turns a silent, total authentication bypass into a startup error.
+const PLACEHOLDER_SECRET_MARKERS: [&str; 6] = [
+    "replace-with",
+    "changeme",
+    "change-me",
+    "placeholder",
+    "your-secret",
+    "insecure",
+];
+
+fn is_placeholder_secret(secret: &str) -> bool {
+    let secret = secret.to_ascii_lowercase();
+    PLACEHOLDER_SECRET_MARKERS
+        .iter()
+        .any(|marker| secret.contains(marker))
 }
 
 fn default_jwt_issuer() -> String {
@@ -263,6 +367,9 @@ fn default_email_provider() -> String {
 fn default_smtp_port() -> u16 {
     587
 }
+fn default_smtp_tls_mode() -> String {
+    "starttls".into()
+}
 
 #[cfg(test)]
 mod tests {
@@ -316,7 +423,7 @@ mod tests {
     #[test]
     fn secrets_are_redacted_when_formatted() {
         let mut settings = base_settings();
-        settings.push(("email_api_token", "provider-token-value".into()));
+        settings.push(("smtp_password", "provider-token-value".into()));
         let config = AppConfig::from_settings(settings).unwrap();
 
         let rendered = format!("{config:?}");
@@ -326,6 +433,76 @@ mod tests {
             config.jwt_secret.expose_secret(),
             "a-development-secret-that-is-long-enough"
         );
+    }
+
+    #[test]
+    fn documented_placeholder_secrets_are_rejected() {
+        // The value shipped in `.env.example`. Accepting it would let anyone who has read the
+        // repository forge access tokens.
+        for placeholder in [
+            "replace-with-a-random-secret-at-least-32-characters-long",
+            "CHANGEME-please-rotate-this-value-now",
+            "my-placeholder-secret-for-development",
+        ] {
+            let settings = vec![
+                ("database_url", "postgres://localhost/submitsnap".to_owned()),
+                ("redis_url", "redis://127.0.0.1:6379".to_owned()),
+                ("jwt_secret", placeholder.to_owned()),
+            ];
+
+            let error = AppConfig::from_settings(settings).unwrap_err().to_string();
+            assert!(error.contains("placeholder"), "{placeholder}: {error}");
+        }
+    }
+
+    #[test]
+    fn smtp_requires_a_host_and_sender() {
+        let mut settings = base_settings();
+        settings.push(("email_provider", "smtp".into()));
+
+        let error = AppConfig::from_settings(settings).unwrap_err().to_string();
+        assert!(error.contains("SMTP_HOST"), "{error}");
+        assert!(error.contains("EMAIL_FROM"), "{error}");
+    }
+
+    #[test]
+    fn smtp_tls_mode_must_be_known() {
+        let mut settings = base_settings();
+        settings.push(("smtp_tls_mode", "ssl".into()));
+
+        let error = AppConfig::from_settings(settings).unwrap_err().to_string();
+        assert!(error.contains("SMTP_TLS_MODE"), "{error}");
+    }
+
+    #[test]
+    fn local_development_produces_no_deployment_warnings() {
+        let config = AppConfig::from_settings(base_settings()).unwrap();
+
+        assert!(config.is_loopback_only());
+        assert!(config.deployment_warnings().is_empty());
+    }
+
+    #[test]
+    fn public_deployment_flags_development_settings() {
+        let mut settings = base_settings();
+        settings.push(("server_host", "0.0.0.0".into()));
+
+        let config = AppConfig::from_settings(settings).unwrap();
+        let warnings = config.deployment_warnings();
+
+        assert!(!config.is_loopback_only());
+        for expected in [
+            "COOKIE_SECURE",
+            "API_DOCS_ENABLED",
+            "REQUIRE_EMAIL_VERIFICATION",
+            "EMAIL_PROVIDER",
+            "PASSWORD_PEPPER",
+        ] {
+            assert!(
+                warnings.iter().any(|warning| warning.contains(expected)),
+                "expected a warning mentioning {expected}, got {warnings:?}"
+            );
+        }
     }
 
     #[test]

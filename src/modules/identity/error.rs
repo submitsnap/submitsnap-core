@@ -18,6 +18,8 @@ pub enum IdentityError {
     EmailNotVerified,
     #[error("invalid or expired token")]
     InvalidToken,
+    #[error("account not found")]
+    NotFound,
     #[error("internal identity error")]
     Internal(#[from] anyhow::Error),
 }
@@ -37,6 +39,7 @@ impl From<IdentityError> for AppError {
             IdentityError::AccountLocked => Self::AccountLocked,
             IdentityError::EmailNotVerified => Self::Forbidden,
             IdentityError::InvalidToken => Self::InvalidToken,
+            IdentityError::NotFound => Self::NotFound,
             IdentityError::Internal(error) => Self::Internal(error),
         }
     }

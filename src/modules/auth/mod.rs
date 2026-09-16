@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use sqlx::PgPool;
 
@@ -96,5 +96,6 @@ where
 {
     Router::new()
         .route("/users", get(handler::list_users))
+        .route("/users/{id}/status", patch(handler::set_user_status))
         .with_state(state)
 }

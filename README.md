@@ -23,7 +23,7 @@ SubmitSnap Cloud will be an optional managed offering built around this project.
 - Append-only audit trail of authentication events
 - Bearer-token login for API clients and HttpOnly cookie login for the dashboard
 - OpenAPI document and Swagger UI generated from the handlers
-- SMTP, Resend, or Postmark email delivery adapters
+- Local SMTP delivery with STARTTLS, implicit TLS, or explicit plaintext
 - Docker Compose for local PostgreSQL and Redis
 
 ## Quick start
@@ -88,10 +88,12 @@ All current API routes are prefixed with `/api/v1`.
 | `POST /identity/password/forgot` | public | Start a password reset. Always reports acceptance. |
 | `POST /identity/password/reset` | token | Complete a reset. The token is single use and every session is revoked. |
 | `GET /admin/users` | session + `admin` | Paginated account listing, demonstrating role-based authorization. |
+| `PATCH /admin/users/{id}/status` | session + `admin` | Disable or re-enable an account. Disabling signs it out everywhere. |
 
 ## Security notes
 
-- **Passwords** are hashed with Argon2id at the OWASP-recommended parameters (19 MiB, 2 iterations). Set `PASSWORD_PEPPER` to mix in a server-side secret; changing it invalidates existing passwords, so treat it as permanent deployment state.
+- **Passwords** are hashed with Argon2id at the OWASP-recommended parameters (19 MiB, 2 iterations). Set `PASSWORD_PEPPER` to mix in a server-side secret; changing it invalidates existing passwords, so treat it as permanent deployment state. Hashes are re-encoded on the next successful sign-in whenever the parameters change.
+- **Configuration is checked at startup.** `JWT_SECRET` must be at least 32 characters and must not be a placeholder — the value shipped in `.env.example` is rejected, so a copied deployment cannot run with a publicly known signing key. `EMAIL_PROVIDER=smtp` requires a host and a sender before the service will boot. When the service is bound to a non-loopback address, it logs a warning for every development-friendly setting still in place (`COOKIE_SECURE`, `API_DOCS_ENABLED`, unverified sign-in, disabled email, missing pepper).
 - **Account enumeration** is avoided on the routes where it matters most: unknown email addresses still pay the cost of a password verification, sign-in failures return one indistinguishable response, and password recovery always reports acceptance. Two deliberate exceptions reveal that an address is registered — `POST /auth/register` reports a conflict, and a locked or disabled account returns `423`/`403` so its owner knows why they cannot sign in.
 - **Brute force** is limited by a per-account lockout after `MAX_FAILED_LOGIN_ATTEMPTS` plus per-IP request budgets. Account-level protection is durable (stored on the account), so it holds across source addresses. Note the trade-off: an attacker who knows an address can lock it for `ACCOUNT_LOCK_DURATION_SECONDS` by failing repeatedly, so keep that window short or add a second factor.
 - **Cookies** are `HttpOnly`, `SameSite=Lax`, and scoped to `/api/v1`. All state-changing routes are `POST` and require a JSON body, which is the CSRF boundary. For any HTTPS deployment set `COOKIE_SECURE=true`, which also enables HSTS.
@@ -101,11 +103,27 @@ All current API routes are prefixed with `/api/v1`.
 
 ## Email delivery
 
-Set `EMAIL_PROVIDER` to `disabled`, `smtp`, `resend`, or `postmark`. SMTP is delivered through Lettre; Resend and Postmark use their HTTP APIs. See [.env.example](.env.example) for all configuration values.
+Core sends mail through your own SMTP server; there is no third-party provider integration. Set `EMAIL_PROVIDER` to `disabled` (the default, which discards messages) or `smtp`, and choose how the connection is protected with `SMTP_TLS_MODE`:
+
+| Mode | Use it for |
+| --- | --- |
+| `starttls` | Port 587. Connects in the clear, then upgrades. The usual choice. |
+| `implicit` | Port 465. TLS from the first byte. |
+| `none` | No encryption. Credentials and message bodies travel in the clear, and a warning is logged. |
+
+Check the settings against the real server before relying on them:
+
+```bash
+make check-email TO=you@example.com
+```
+
+The command loads `.env`, builds the transport, and sends one message, so a wrong host, port, TLS mode, or credential fails immediately instead of during someone's registration. `EMAIL_PROVIDER=disabled` is refused here rather than reporting a success that did not happen.
 
 The worker moves delivery failures to the Redis dead-letter list `submitsnap:email-dead-letter`. Monitor and replay those jobs as part of normal operations.
 
 Verification and reset links point at `APP_BASE_URL` (`/verify-email?token=…` and `/reset-password?token=…`). Point it at the web application that will consume them.
+
+Handing a message to the queue is retried a few times so a brief Redis blip does not lose a verification link, and an exhausted retry is logged. That is a mitigation, not a guarantee: a durable transactional outbox is the correct long-term answer and is on the roadmap. Until then, if the queue is down for long enough, the user can request another link.
 
 ## API documentation
 

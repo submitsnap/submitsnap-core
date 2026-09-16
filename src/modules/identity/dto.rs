@@ -101,6 +101,29 @@ pub struct ResendVerificationRequest {
     pub email: String,
 }
 
+/// The status values an administrator may set. `pending` is deliberately excluded: it is
+/// assigned by the system when verification is required, not chosen by an operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountStatusUpdate {
+    Active,
+    Disabled,
+}
+
+impl From<AccountStatusUpdate> for UserStatus {
+    fn from(update: AccountStatusUpdate) -> Self {
+        match update {
+            AccountStatusUpdate::Active => Self::Active,
+            AccountStatusUpdate::Disabled => Self::Disabled,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateUserStatusRequest {
+    pub status: AccountStatusUpdate,
+}
+
 /// Response body for operations whose details must not be disclosed.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MessageResponse {

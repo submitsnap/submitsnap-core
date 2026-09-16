@@ -1,10 +1,11 @@
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar};
+use uuid::Uuid;
 
 use crate::{
     modules::{
@@ -17,7 +18,8 @@ use crate::{
         identity::{
             PublicUser,
             dto::{
-                LoginRequest, MessageResponse, PaginationQuery, RegisterRequest, UserListResponse,
+                LoginRequest, MessageResponse, PaginationQuery, RegisterRequest,
+                UpdateUserStatusRequest, UserListResponse,
             },
         },
         rbac::RoleName,
@@ -335,6 +337,45 @@ pub async fn list_users(
     let (users, total) = state.identity.list_users(limit, offset).await?;
 
     Ok(Json(UserListResponse { users, total }))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/admin/users/{id}/status",
+    tag = "admin",
+    security(("bearer_auth" = []), ("cookie_auth" = [])),
+    params(("id" = Uuid, Path, description = "Account identifier")),
+    request_body = UpdateUserStatusRequest,
+    responses(
+        (status = 200, description = "Account status updated", body = PublicUser),
+        (status = 400, description = "Request was not valid, including an administrator targeting themselves", body = ErrorResponse),
+        (status = 401, description = "Not authenticated", body = ErrorResponse),
+        (status = 403, description = "Administrator role required", body = ErrorResponse),
+        (status = 404, description = "No such account", body = ErrorResponse),
+    )
+)]
+pub async fn set_user_status(
+    State(state): State<AuthState>,
+    client: ClientInfo,
+    user: AuthenticatedUser,
+    Path(target_id): Path<Uuid>,
+    Json(request): Json<UpdateUserStatusRequest>,
+) -> Result<Json<PublicUser>, AppError> {
+    user.require_role(&RoleName::admin())?;
+
+    // Guards against an administrator locking themselves out of the instance.
+    if target_id == user.user.id {
+        return Err(AppError::Validation(
+            "an administrator cannot change their own account status".into(),
+        ));
+    }
+
+    let updated = state
+        .identity
+        .set_account_status(target_id, request.status.into(), &client)
+        .await?;
+
+    Ok(Json(updated))
 }
 
 fn clear_credentials(jar: CookieJar, cookie_secure: bool) -> CookieJar {
