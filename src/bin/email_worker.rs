@@ -14,7 +14,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig::from_env()?;
     let queue = EmailQueue::connect(&config.redis_url)?;
-    let email = EmailClient::from_config(&config.email)?;
+    let email = EmailClient::from_config(&config.email_settings())?;
     info!("email worker started");
 
     loop {

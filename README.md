@@ -2,7 +2,7 @@
 
 The self-hostable backend for SubmitSnap: an open-source form-submission platform built with Rust, Axum, PostgreSQL, Redis, and Tokio.
 
-> **Project status: foundation.** Authentication, configuration, observability, email delivery, and local infrastructure are in place. Public form ingestion, submissions, workspaces, webhook delivery, and the dashboard are planned but not implemented yet. See the [roadmap](#roadmap).
+> **Project status: foundation.** Authentication, identity, configuration, observability, email delivery, and local infrastructure are in place. Public form ingestion, submissions, workspaces, webhook delivery, and the dashboard are planned but not implemented yet. See the [roadmap](#roadmap).
 
 ## Why Core is open source
 
@@ -12,12 +12,17 @@ SubmitSnap Cloud will be an optional managed offering built around this project.
 
 ## Current capabilities
 
-- Axum HTTP service with structured JSON tracing
+- Axum HTTP service with structured JSON tracing, request timeouts, body limits, and security headers
 - PostgreSQL with SQLx migrations
 - Redis-backed asynchronous email jobs and a separate worker
-- Argon2 password hashing and JWT authentication
-- Bearer-token API login and HttpOnly dashboard-cookie login
-- Boundary validation with `validator` and IP-based request limiting with `governor`
+- Argon2id password hashing and short-lived JWT access tokens
+- Rotating, revocable refresh tokens with reuse detection
+- Email verification, password reset, and password change flows
+- Per-account login lockout plus per-IP request limiting
+- Role-based authorization with `user` and `admin` roles
+- Append-only audit trail of authentication events
+- Bearer-token login for API clients and HttpOnly cookie login for the dashboard
+- OpenAPI document and Swagger UI generated from the handlers
 - SMTP, Resend, or Postmark email delivery adapters
 - Docker Compose for local PostgreSQL and Redis
 
@@ -31,7 +36,7 @@ cd submitsnap-core
 cp .env.example .env
 ```
 
-Set a unique `JWT_SECRET` of at least 32 characters in `.env`. Then start the backing services and apply migrations:
+Set a unique `JWT_SECRET` of at least 32 characters in `.env`. The defaults in `.env.example` match `compose.yaml`, which publishes PostgreSQL on `5499` and Redis on `6399`. Then start the backing services and apply migrations:
 
 ```bash
 docker compose up -d
@@ -46,20 +51,53 @@ cargo run
 cargo run --bin email_worker
 ```
 
-The API is available at `http://127.0.0.1:8080`; `GET /health` verifies PostgreSQL and Redis connectivity.
+The `Makefile` wraps the same steps, loading values from `.env`:
 
-## Authentication endpoints
+```bash
+make            # list every target
+make bootstrap  # start PostgreSQL and Redis, then rebuild the database from migrations
+make run        # API server
+make worker     # email worker
+```
+
+The API is available at `http://127.0.0.1:8080`. `GET /health` verifies PostgreSQL and Redis connectivity, and `GET /docs` serves the interactive OpenAPI reference.
+
+## Authentication model
+
+Clients receive two credentials:
+
+- **Access token** — a short-lived JWT (15 minutes by default). Send it as `Authorization: Bearer <token>`. Its claims include the account (`sub`), the session (`sid`), a unique token id (`jti`), issuer, audience, and issued/not-before/expiry timestamps. The verifier pins HS256 and validates every one of those claims.
+- **Refresh token** — a 256-bit opaque value. Only its SHA-256 hash is stored. It is rotated on every use, and replaying an already-used token is treated as theft: the entire session family is revoked and a `token_reuse_detected` event is recorded.
+
+Because the session is re-checked on every authenticated request, `POST /auth/logout` takes effect immediately rather than when the access token expires.
 
 All current API routes are prefixed with `/api/v1`.
 
-| Endpoint | Purpose |
-| --- | --- |
-| `POST /auth/register` | Register a user with an email and a 12+ character password. |
-| `POST /auth/login` | Return a Bearer token for programmatic API clients. |
-| `POST /auth/dashboard/login` | Set an HttpOnly, SameSite=Lax cookie without returning a token to dashboard JavaScript. |
-| `GET /auth/me` | Return the current user from a Bearer token or dashboard cookie. |
+| Endpoint | Auth | Purpose |
+| --- | --- | --- |
+| `POST /auth/register` | public | Create an account and send the confirmation link. Returns the created user; the client then signs in. |
+| `POST /auth/login` | public | Return an access token and a refresh token in the body, for API clients. |
+| `POST /auth/dashboard/login` | public | Set HttpOnly cookies and return the user, for browser clients. Tokens never reach JavaScript. |
+| `POST /auth/refresh` | refresh token | Rotate the refresh token. API clients pass it in the body; browsers send the cookie and receive new cookies. |
+| `POST /auth/logout` | session | Revoke the current session and clear cookies. |
+| `POST /auth/logout-all` | session | Revoke every session for the account. |
+| `GET /auth/me` | session | Return the current account, including roles. |
+| `POST /auth/password/change` | session | Replace the password after confirming the current one; other sessions are signed out. |
+| `POST /identity/email/verify` | token | Confirm an email address using a single-use link token. |
+| `POST /identity/email/verification` | public | Re-send the confirmation link. Reveals nothing about whether an account exists. |
+| `POST /identity/password/forgot` | public | Start a password reset. Always reports acceptance. |
+| `POST /identity/password/reset` | token | Complete a reset. The token is single use and every session is revoked. |
+| `GET /admin/users` | session + `admin` | Paginated account listing, demonstrating role-based authorization. |
 
-For any HTTPS deployment, set `COOKIE_SECURE=true`. Deployments behind a proxy should enforce client rate limits at the proxy or preserve the actual client socket address; Core intentionally does not trust spoofable forwarded-IP headers.
+## Security notes
+
+- **Passwords** are hashed with Argon2id at the OWASP-recommended parameters (19 MiB, 2 iterations). Set `PASSWORD_PEPPER` to mix in a server-side secret; changing it invalidates existing passwords, so treat it as permanent deployment state.
+- **Account enumeration** is avoided on the routes where it matters most: unknown email addresses still pay the cost of a password verification, sign-in failures return one indistinguishable response, and password recovery always reports acceptance. Two deliberate exceptions reveal that an address is registered — `POST /auth/register` reports a conflict, and a locked or disabled account returns `423`/`403` so its owner knows why they cannot sign in.
+- **Brute force** is limited by a per-account lockout after `MAX_FAILED_LOGIN_ATTEMPTS` plus per-IP request budgets. Account-level protection is durable (stored on the account), so it holds across source addresses. Note the trade-off: an attacker who knows an address can lock it for `ACCOUNT_LOCK_DURATION_SECONDS` by failing repeatedly, so keep that window short or add a second factor.
+- **Cookies** are `HttpOnly`, `SameSite=Lax`, and scoped to `/api/v1`. All state-changing routes are `POST` and require a JSON body, which is the CSRF boundary. For any HTTPS deployment set `COOKIE_SECURE=true`, which also enables HSTS.
+- **CORS** is disabled unless `CORS_ALLOWED_ORIGINS` lists explicit origins. Credentialed requests are never allowed from a wildcard origin.
+- **Rate limiting does not trust forwarded-IP headers**, because they are spoofable. Serve the API with real client socket addresses; enforce additional limits at a proxy if you run one.
+- **Audit events** are appended to `auth_events` and never block the operation they describe. `auth_events.email` records the address attempted during failed sign-ins, which is personal data: define a retention policy and prune old rows, for example `DELETE FROM auth_events WHERE created_at < NOW() - INTERVAL '90 days'`.
 
 ## Email delivery
 
@@ -67,7 +105,32 @@ Set `EMAIL_PROVIDER` to `disabled`, `smtp`, `resend`, or `postmark`. SMTP is del
 
 The worker moves delivery failures to the Redis dead-letter list `submitsnap:email-dead-letter`. Monitor and replay those jobs as part of normal operations.
 
+Verification and reset links point at `APP_BASE_URL` (`/verify-email?token=…` and `/reset-password?token=…`). Point it at the web application that will consume them.
+
+## API documentation
+
+The handlers generate an OpenAPI 3 document, served with Swagger UI:
+
+| Path | Contents |
+| --- | --- |
+| `GET /docs` | Interactive reference, including both security schemes. |
+| `GET /api-docs/openapi.json` | The raw document, for code generation and tooling. |
+
+Set `API_DOCS_ENABLED=false` to omit both routes.
+
 ## Architecture direction
+
+Modules are vertical slices with the same internal shape (handler, service, repository, DTOs, errors):
+
+```text
+src/modules/
+  auth/       login, sessions, access tokens, the authenticated-user extractor
+  identity/   accounts, credentials, email verification, password recovery, audit events
+  session/    refresh token families, rotation, and revocation
+  rbac/       roles and grants
+```
+
+Dependencies flow one way: `auth` depends on `identity` and `session`; `identity` depends on `session` and `rbac`. Nothing depends on `auth`.
 
 When form ingestion is introduced, PostgreSQL will remain the durable source of truth:
 
@@ -89,15 +152,22 @@ A submission must be stored transactionally before any asynchronous work is acce
 - [ ] Submission inbox API and data export
 - [ ] JavaScript SDK and React hooks
 - [ ] Dashboard integration
+- [ ] First-party (TOTP) and passkey second factors
 - [ ] Self-hosted bootstrap-admin, backup, and upgrade guides
 
 ## Testing
 
 ```bash
-cargo test --lib
+make test-unit   # or: cargo test --lib
 ```
 
-This runs password and mocked email-provider tests. The SQLx integration test at [tests/database.rs](tests/database.rs) requires a disposable PostgreSQL database through `DATABASE_URL`; SQLx creates an isolated test database and runs migrations.
+Unit tests cover configuration loading, token signing and verification, password hashing, cookie flags, and error mapping.
+
+Integration tests use `#[sqlx::test]`, which creates a disposable database and applies `migrations/` to it. They require `DATABASE_URL` pointing at a PostgreSQL server where SQLx can create temporary databases, and they deliberately point Redis at an unreachable address so they never depend on a queue being up:
+
+```bash
+make test        # or: DATABASE_URL=... cargo test
+```
 
 ## Contributing and security
 

@@ -6,6 +6,7 @@ use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor, message::Mailbox,
     transport::smtp::authentication::Credentials,
 };
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::shared::{config::EmailConfig, queue::EmailJob};
 
@@ -34,8 +35,10 @@ impl EmailClient {
                 if let (Some(username), Some(password)) =
                     (&config.smtp_username, &config.smtp_password)
                 {
-                    builder =
-                        builder.credentials(Credentials::new(username.clone(), password.clone()));
+                    builder = builder.credentials(Credentials::new(
+                        username.clone(),
+                        password.expose_secret().to_owned(),
+                    ));
                 }
                 Ok(Self::Smtp {
                     client: builder.build(),
@@ -77,6 +80,14 @@ impl EmailClient {
 fn required<'a>(value: &'a Option<String>, setting: &str) -> anyhow::Result<&'a str> {
     value
         .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{setting} is required"))
+}
+
+fn required_secret<'a>(value: &'a Option<SecretString>, setting: &str) -> anyhow::Result<&'a str> {
+    value
+        .as_ref()
+        .map(|secret| secret.expose_secret())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("{setting} is required"))
 }

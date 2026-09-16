@@ -1,13 +1,16 @@
 use thiserror::Error;
 
-use crate::shared::error::AppError;
+use crate::{modules::identity::IdentityError, shared::error::AppError};
 
 #[derive(Debug, Error)]
 pub enum AuthError {
-    #[error("invalid credentials")]
-    InvalidCredentials,
-    #[error("email is already registered")]
-    EmailTaken,
+    /// Credential, lockout, and account-state failures raised by the identity domain.
+    #[error(transparent)]
+    Identity(#[from] IdentityError),
+    /// Access or refresh token could not be trusted. Always surfaced as 401 so the client
+    /// knows to authenticate again.
+    #[error("invalid or expired token")]
+    InvalidToken,
     #[error("internal authentication error")]
     Internal(#[from] anyhow::Error),
 }
@@ -15,8 +18,8 @@ pub enum AuthError {
 impl From<AuthError> for AppError {
     fn from(error: AuthError) -> Self {
         match error {
-            AuthError::InvalidCredentials => Self::Unauthorized,
-            AuthError::EmailTaken => Self::Conflict,
+            AuthError::Identity(error) => error.into(),
+            AuthError::InvalidToken => Self::Unauthorized,
             AuthError::Internal(error) => Self::Internal(error),
         }
     }

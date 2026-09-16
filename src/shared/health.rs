@@ -1,9 +1,10 @@
 use axum::{Json, extract::State};
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use crate::shared::{error::AppError, state::AppState};
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct HealthResponse {
     pub status: &'static str,
 }

@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(npx -y skills find security audit vulnerability 2 >& 1)",
+      "Shell(npx -y skills find rust 2 >& 1)",
+      "Shell(npx -y skills find code review 2 >& 1)",
+      "Shell(npx -y skills find security 2 >& 1)",
+      "Shell(npx -y skills find best practices 2 >& 1)",
+      "Shell(npx -y skills find rust security clippy audit 2 >& 1)",
+      "Shell(npx -y skills find vulnerability 2 >& 1)",
+      "Shell(npx -y skills find testing 2 >& 1)",
+      "Shell(npx -y skills find rust --owner apollographql 2 >& 1)",
+      "Shell(cmd:*)"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}

@@ -15,15 +15,16 @@ Thanks for helping improve SubmitSnap Core. By contributing, you agree that your
 3. Apply migrations with `sqlx migrate run`.
 4. Run the API with `cargo run` and the email worker with `cargo run --bin email_worker`.
 
+The `Makefile` wraps these steps and reads values from `.env`. Run `make` with no arguments to list every target; `make bootstrap` starts the services and rebuilds the database from migrations, and `make db-reset` drops it first.
+
 Before submitting a pull request, run:
 
 ```bash
-cargo fmt --check
-cargo check --all-targets
-cargo test --lib
+make lint
+make test-unit
 ```
 
-Run the SQLx integration test as well when changing schema or database behavior. It requires `DATABASE_URL` pointing to a PostgreSQL server where SQLx can create temporary test databases.
+`make lint` checks formatting and runs Clippy with warnings denied. `make test` runs the database-backed integration tests as well; it needs `DATABASE_URL` pointing to a PostgreSQL server where SQLx can create temporary test databases.
 
 ## Pull requests
 

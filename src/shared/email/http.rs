@@ -3,7 +3,7 @@ use serde_json::json;
 
 use crate::shared::{config::EmailConfig, queue::EmailJob};
 
-use super::required;
+use super::{required, required_secret};
 
 #[derive(Clone)]
 pub struct HttpEmailClient {
@@ -36,7 +36,7 @@ impl HttpEmailClient {
         Ok(Self {
             client: Client::new(),
             endpoint,
-            token: required(&config.email_api_token, "EMAIL_API_TOKEN")?.to_owned(),
+            token: required_secret(&config.email_api_token, "EMAIL_API_TOKEN")?.to_owned(),
             from: required(&config.email_from, "EMAIL_FROM")?.to_owned(),
             provider,
         })
