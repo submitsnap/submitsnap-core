@@ -136,6 +136,36 @@ The handlers generate an OpenAPI 3 document, served with Swagger UI:
 
 Set `API_DOCS_ENABLED=false` to omit both routes.
 
+## Logging
+
+`LOG_FORMAT` decides how records are rendered:
+
+| Value | Appearance |
+| --- | --- |
+| `pretty` (default) | Coloured lines, plus a startup banner with the bound address, the database and queue status, the Swagger UI URL, and a one-line summary of the active settings. |
+| `json` | One JSON object per line, for a log collector. No banner. |
+
+The default log level also follows the format: a pretty run traces every request (method, URI, status, latency), while a JSON run logs at `info` so a deployed service is not drowned in request lines. Set `RUST_LOG` to override either default, and `NO_COLOR=1` to keep the pretty layout without ANSI escapes.
+
+```
+  SubmitSnap Core 0.1.0
+
+  API        http://127.0.0.1:8080
+  Health     http://127.0.0.1:8080/health
+  Swagger UI http://127.0.0.1:8080/docs
+  OpenAPI    http://127.0.0.1:8080/api-docs/openapi.json
+
+  Database   postgres://***@localhost:5499/submitsnap
+  Queue      reachable redis://127.0.0.1:6399
+  Email      disabled (outgoing messages are discarded)
+
+  email verification optional  ·  insecure cookies (COOKIE_SECURE=false)
+
+  Press Ctrl+C to stop
+```
+
+Credentials in connection strings are redacted, so the banner is safe to leave in a terminal or a recorded session.
+
 ## Architecture direction
 
 Modules are vertical slices with the same internal shape (handler, service, repository, DTOs, errors):

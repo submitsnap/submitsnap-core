@@ -1,9 +1,13 @@
 # SubmitSnap Core — developer tasks.
 #
-# Run `make` with no arguments to list the targets. Values from `.env` are loaded and
-# exported to every recipe, so the defaults below only apply when `.env` is absent. Any
-# variable can be overridden on the command line, for example:
+# Run `make` with no arguments to list the targets.
 #
+# Values from `.env` are loaded and exported to every recipe, and they win over variables set
+# in the ambient environment. Note that this is the opposite of the application's own dotenv
+# loader, which leaves an existing environment variable alone. Override on the command line
+# instead, where an assignment beats both:
+#
+#   make run SERVER_PORT=9000
 #   make test DATABASE_URL=postgres://postgres:postgres@localhost:5432/other
 
 SHELL   := /bin/bash

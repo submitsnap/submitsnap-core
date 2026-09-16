@@ -11,18 +11,12 @@
 
 use std::env;
 
-use submitsnap_core::shared::{config::AppConfig, email::EmailClient, queue::EmailJob};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use submitsnap_core::shared::{config::AppConfig, email::EmailClient, logging, queue::EmailJob};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    logging::init(logging::configured_format());
 
     let recipient = env::args()
         .nth(1)

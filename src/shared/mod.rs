@@ -1,8 +1,10 @@
+pub mod banner;
 pub mod config;
 pub mod db;
 pub mod email;
 pub mod error;
 pub mod health;
+pub mod logging;
 pub mod queue;
 pub mod ratelimit;
 pub mod request;

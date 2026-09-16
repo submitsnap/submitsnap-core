@@ -26,6 +26,9 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 - `check_email` binary and `make check-email`, which send one message so SMTP settings can be validated without going through registration.
 - Startup validation that rejects placeholder `JWT_SECRET` values and incomplete SMTP configuration, plus warnings for settings that are unsafe on a non-loopback address.
 - Retry with backoff when handing a message to the email queue, so a transient broker failure does not lose a verification link.
+- `LOG_FORMAT` selecting human-readable coloured logs (the default) or JSON for a log collector, with request-level tracing enabled for the readable format.
+- Startup banner showing the bound address, the database and email queue status, the Swagger UI and OpenAPI URLs, and a summary of the active settings, with credentials redacted from connection strings.
+- Email queue reachability is checked at startup and reported, instead of surfacing at the first sign-up.
 
 ### Changed
 
@@ -37,6 +40,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 - Local Compose ports now map to the ports PostgreSQL and Redis actually listen on.
 - Error responses carry a stable machine-readable `code` alongside the human-readable message.
 - Password hashes are re-encoded on successful sign-in when the Argon2 parameters have changed.
+- Logs are human-readable by default instead of raw JSON lines.
 
 ### Removed
 
