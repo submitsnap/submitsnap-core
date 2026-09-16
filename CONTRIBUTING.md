@@ -13,7 +13,7 @@ Thanks for helping improve SubmitSnap Core. By contributing, you agree that your
 1. Copy `.env.example` to `.env` and set a development-only `JWT_SECRET`.
 2. Run `docker compose up -d` for PostgreSQL and Redis.
 3. Apply migrations with `sqlx migrate run`.
-4. Run the API with `cargo run` and the email worker with `cargo run --bin email_worker`.
+4. Run the API with `cargo run` and the background worker with `cargo run --bin worker`.
 
 The `Makefile` wraps these steps and reads values from `.env`. Run `make` with no arguments to list every target; `make bootstrap` starts the services and rebuilds the database from migrations, and `make db-reset` drops it first.
 

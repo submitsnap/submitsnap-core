@@ -2,7 +2,7 @@
 name = "submitsnap-core"
 version = "0.1.0"
 edition = "2024"
-# `cargo run` starts the API; the worker is started explicitly with `--bin email_worker`.
+# `cargo run` starts the API; the worker is started explicitly with `--bin worker`.
 default-run = "submitsnap-core"
 
 [dependencies]
@@ -11,15 +11,21 @@ argon2 = "0.5"
 axum = "0.8"
 axum-extra = { version = "0.12.6", features = ["cookie"] }
 base64 = "0.23.1"
+bytes = "1.12.1"
 chrono = { version = "0.4", features = ["serde"] }
 deadpool-redis = "0.16"
 dotenvy = "0.15"
 envy = "0.4"
+futures-util = "0.3.34"
 governor = "0.6"
+hex = "0.4.3"
+hmac = "0.13.0"
 jsonwebtoken = "9"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"] }
+object_store = { version = "0.14.2", features = ["aws"] }
 rand = "0.8"
 redis = { version = "0.26", features = ["tokio-comp"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["http2", "rustls"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -28,6 +34,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid"
 thiserror = "1"
 time = "0.3.55"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors", "limit", "set-header", "timeout", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -38,3 +45,7 @@ validator = { version = "0.18", features = ["derive"] }
 
 [dev-dependencies]
 tower = { version = "0.5.3", features = ["util"] }
+# The storage tests inspect the bucket directly. "Nothing was left behind" is a claim about the
+# bucket rather than about the database, so it is asserted where it can actually be observed.
+object_store = { version = "0.14.2", features = ["aws"] }
+futures-util = "0.3"

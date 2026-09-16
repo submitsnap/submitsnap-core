@@ -4,6 +4,7 @@ pub mod identity;
 pub mod organization;
 pub mod rbac;
 pub mod session;
+pub mod webhook;
 
 use std::sync::Arc;
 
@@ -12,9 +13,9 @@ use sqlx::PgPool;
 use crate::{
     modules::{
         auth::AuthService, form::FormService, identity::IdentityService,
-        organization::OrganizationService,
+        organization::OrganizationService, webhook::WebhookService,
     },
-    shared::{config::AppConfig, queue::EmailQueue, ratelimit::RateLimiters},
+    shared::{config::AppConfig, queue::EmailQueue, ratelimit::RateLimiters, storage::FileStorage},
 };
 
 /// Everything the HTTP layer needs, assembled once at startup.
@@ -28,6 +29,7 @@ pub struct ApiState {
     pub identity: Arc<IdentityService>,
     pub organizations: Arc<OrganizationService>,
     pub forms: Arc<FormService>,
+    pub webhooks: Arc<WebhookService>,
     pub config: Arc<AppConfig>,
     pub limiters: RateLimiters,
 }
@@ -52,11 +54,21 @@ impl ApiState {
             config.clone(),
         ));
         let organizations = Arc::new(OrganizationService::new(database.clone(), identity.clone()));
+        let webhooks = Arc::new(WebhookService::new(
+            database.clone(),
+            organizations.clone(),
+            config.webhook_allow_private_targets,
+        ));
+        // Built once so the whole process agrees on whether storage exists, and so a broken S3
+        // setting stops the service at startup rather than at the first upload.
+        let storage = Arc::new(FileStorage::from_config(&config)?);
         let forms = Arc::new(FormService::new(
             database,
             organizations.clone(),
             limiters.submissions_per_form.clone(),
-            config.file_uploads_enabled(),
+            storage,
+            config.upload_max_bytes,
+            config.upload_ttl_hours,
         ));
 
         Ok(Self {
@@ -64,6 +76,7 @@ impl ApiState {
             identity,
             organizations,
             forms,
+            webhooks,
             config,
             limiters,
         })

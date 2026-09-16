@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig::from_env()?;
     let database = db::connect(&config).await?;
-    let queue = EmailQueue::connect(&config.redis_url)?;
+    let queue = EmailQueue::connect(&config.redis_url, &config.redis_key_prefix)?;
     let identity = IdentityService::new(database, queue, Arc::new(config))?;
 
     let user_id = identity

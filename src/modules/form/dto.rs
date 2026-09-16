@@ -6,7 +6,7 @@ use validator::Validate;
 
 use crate::{
     modules::form::{
-        model::{FormRecord, FormStatus},
+        model::{FormRecord, FormStatus, SubmissionFilters, SubmissionRecord, SubmissionStatus},
         validation::{FieldDefinition, FormSchema, HONEYPOT_FIELD},
     },
     shared::pagination::page_bounds,
@@ -22,6 +22,10 @@ pub struct CreateFormRequest {
     #[schema(example = "Contact us")]
     pub name: String,
     pub schema: FormSchema,
+    /// Where to notify on each submission. Optional: a form that only collects is legitimate.
+    #[serde(default)]
+    #[validate(length(max = 20, message = "at most 20 notification addresses"))]
+    pub notify_emails: Vec<String>,
 }
 
 /// Every field is optional: an absent one is left alone, and sending `null` for one of the
@@ -140,6 +144,124 @@ pub struct SubmissionAcceptedResponse {
     pub id: Uuid,
     pub success_message: Option<String>,
     pub redirect_url: Option<String>,
+}
+
+/// What an organization sees of a submission. The provenance columns are deliberately absent:
+/// an inbox needs the answers, not the visitor's address.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SubmissionResponse {
+    pub id: Uuid,
+    pub form_id: Uuid,
+    /// The field set this submission was written against.
+    pub schema_version: i32,
+    pub data: serde_json::Value,
+    /// Attachment metadata per field key, empty for most submissions. Present so an inbox can
+    /// offer a download without a second request per row.
+    pub files: serde_json::Value,
+    pub status: SubmissionStatus,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<SubmissionRecord> for SubmissionResponse {
+    fn from(submission: SubmissionRecord) -> Self {
+        Self {
+            id: submission.id,
+            form_id: submission.form_id,
+            schema_version: submission.schema_version,
+            data: submission.data.0,
+            files: submission.files.0,
+            status: submission.status,
+            created_at: submission.created_at,
+        }
+    }
+}
+
+/// The answer to a completed upload. `key` is what the client sends back as the field's value.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UploadedFileResponse {
+    pub key: String,
+    pub filename: String,
+    pub content_type: String,
+    pub size: i64,
+}
+
+/// Query accepted by the upload route.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UploadQuery {
+    /// Shown back to a human, and used in the download header. Never used to build a path, so it
+    /// is only sanitised for display, not treated as a location.
+    #[serde(default)]
+    pub filename: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SubmissionListResponse {
+    pub submissions: Vec<SubmissionResponse>,
+    pub total: i64,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateSubmissionRequest {
+    pub status: SubmissionStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    Csv,
+    Json,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ExportQuery {
+    /// Defaults to CSV.
+    pub format: Option<ExportFormat>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SubmissionQuery {
+    #[param(minimum = 1, maximum = 100)]
+    pub limit: Option<u32>,
+    #[param(minimum = 0)]
+    pub offset: Option<u32>,
+    /// Only meaningful for the organization-wide inbox; the per-form listing takes it from the
+    /// path.
+    pub form_id: Option<Uuid>,
+    pub status: Option<SubmissionStatus>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    /// An answer key to match, together with `value`.
+    pub field: Option<String>,
+    /// Parsed as JSON when it parses, so a number or a boolean matches its stored type rather
+    /// than being compared as a string.
+    pub value: Option<String>,
+}
+
+impl SubmissionQuery {
+    pub fn bounds(&self) -> (i64, i64) {
+        page_bounds(self.limit, self.offset)
+    }
+
+    /// `form_id` overrides whatever the query string carried, for the routes nested under a
+    /// form.
+    pub fn filters(&self, form_id: Option<Uuid>) -> SubmissionFilters {
+        SubmissionFilters {
+            form_id: form_id.or(self.form_id),
+            status: self.status,
+            since: self.since,
+            until: self.until,
+            contains: match (self.field.as_deref(), self.value.as_deref()) {
+                (Some(field), Some(value)) => Some((
+                    field.to_owned(),
+                    serde_json::from_str(value)
+                        .unwrap_or_else(|_| serde_json::Value::String(value.to_owned())),
+                )),
+                _ => None,
+            },
+        }
+    }
 }
 
 impl PublicFormResponse {

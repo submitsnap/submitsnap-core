@@ -16,7 +16,12 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use submitsnap_core::{
     app,
-    modules::identity::IdentityService,
+    dispatcher::Dispatcher,
+    modules::{
+        identity::IdentityService,
+        organization::OrganizationService,
+        webhook::{WebhookDeliverer, WebhookService},
+    },
     shared::{config::AppConfig, queue::EmailQueue, state::AppState},
 };
 use tower::ServiceExt;
@@ -59,8 +64,87 @@ pub fn identity_service(config: &Arc<AppConfig>, pool: PgPool) -> IdentityServic
         .expect("identity service builds")
 }
 
-fn email_queue(config: &AppConfig) -> EmailQueue {
-    EmailQueue::connect(&config.redis_url).expect("queue pool builds")
+pub fn email_queue(config: &AppConfig) -> EmailQueue {
+    EmailQueue::connect(&config.redis_url, &config.redis_key_prefix).expect("queue pool builds")
+}
+
+/// Matches the worker's own batch size, so a test cannot pass by draining more in one pass than
+/// a real deployment would.
+pub const DISPATCH_BATCH: i64 = 20;
+
+/// The queue a test can actually talk to.
+///
+/// Most tests deliberately point at an unreachable Redis, because nothing they exercise should
+/// depend on it. Dispatch does — an enqueue that fails is a failure, by design — so a test of
+/// the dispatch path points at the real server under a prefix of its own and never sees another
+/// test's jobs.
+pub fn reachable_redis_config(extra: Vec<(&str, String)>) -> Arc<AppConfig> {
+    let mut settings = extra;
+    settings.push(("redis_url", "redis://127.0.0.1:6399".to_owned()));
+    settings.push((
+        "redis_key_prefix",
+        format!("submitsnap-test-{}", uuid::Uuid::new_v4()),
+    ));
+
+    Arc::new(config_with(settings))
+}
+
+/// The same service graph the worker builds.
+///
+/// A test drives the real dispatch and delivery path rather than a stand-in, which is the only
+/// way assertions about retries, signatures, and idempotency mean anything.
+pub fn worker_graph(
+    config: &Arc<AppConfig>,
+    pool: PgPool,
+) -> (Arc<Dispatcher>, WebhookDeliverer, EmailQueue) {
+    let queue = email_queue(config);
+    let identity = IdentityService::new(pool.clone(), queue.clone(), config.clone())
+        .expect("identity service builds");
+    let organizations = Arc::new(OrganizationService::new(pool.clone(), Arc::new(identity)));
+    let webhooks = Arc::new(WebhookService::new(
+        pool.clone(),
+        organizations,
+        config.webhook_allow_private_targets,
+    ));
+
+    let dispatcher = Arc::new(Dispatcher::new(
+        pool.clone(),
+        queue.clone(),
+        webhooks,
+        DISPATCH_BATCH,
+    ));
+    let deliverer = WebhookDeliverer::new(pool, config.webhook_timeout_seconds, DISPATCH_BATCH)
+        .expect("deliverer builds");
+
+    (dispatcher, deliverer, queue)
+}
+
+/// A `TestApp` whose service graph a test can also drive as a worker.
+pub fn with_worker_config(extra: Vec<(&str, String)>, pool: PgPool) -> (TestApp, Arc<AppConfig>) {
+    let config = reachable_redis_config(extra);
+    let state = AppState::new(config.clone(), pool, email_queue(&config));
+
+    let app = TestApp {
+        router: app(state).expect("app builds"),
+        config: config.clone(),
+    };
+
+    (app, config)
+}
+
+/// The service graph the app builds, exposed so a test can drive a service directly rather than
+/// only through HTTP — which is the only way to exercise something the worker runs on a timer,
+/// such as collecting abandoned uploads.
+pub fn api_state(config: &Arc<AppConfig>, pool: PgPool) -> submitsnap_core::modules::ApiState {
+    let state = AppState::new(config.clone(), pool, email_queue(config));
+
+    submitsnap_core::modules::ApiState::new(
+        state.database.clone(),
+        state.queue.clone(),
+        state.config.clone(),
+        state.rate_limiters.clone(),
+    )
+    .expect("the service graph builds")
 }
 
 /// The HTTP application under test, driven in-process through `tower::ServiceExt::oneshot`.

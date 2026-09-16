@@ -89,6 +89,43 @@ pub struct AppConfig {
     /// except that a form containing a file field cannot be published.
     #[serde(default)]
     pub s3_bucket: Option<String>,
+    #[serde(default = "default_s3_region")]
+    pub s3_region: String,
+    /// Unset for AWS. Set it for anything else: Cloudflare R2, MinIO, Backblaze B2, and so on.
+    #[serde(default)]
+    pub s3_endpoint: Option<String>,
+    /// Left unset, the SDK's own credential chain is used, which is how instance roles work.
+    #[serde(default)]
+    pub s3_access_key_id: Option<String>,
+    #[serde(default)]
+    pub s3_secret_access_key: Option<SecretString>,
+    /// Most non-AWS endpoints address buckets as `host/bucket` rather than `bucket.host`.
+    #[serde(default)]
+    pub s3_force_path_style: bool,
+    /// The ceiling for one uploaded file, no matter what a form asks for. A form cannot raise it.
+    #[serde(default = "default_upload_max_bytes")]
+    pub upload_max_bytes: u64,
+    /// How long an upload may sit unclaimed before the worker deletes it.
+    #[serde(default = "default_upload_ttl_hours")]
+    pub upload_ttl_hours: u64,
+
+    /// How long a webhook delivery waits for the receiver before it is counted as a failure.
+    #[serde(default = "default_webhook_timeout_seconds")]
+    pub webhook_timeout_seconds: u64,
+
+    /// Whether a webhook may point at a loopback or link-local address.
+    ///
+    /// Off by default, because a webhook URL is fetched *by this server*, which makes the
+    /// link-local range — where cloud instance credentials live — reachable by anyone who can
+    /// administer an organization. Turn it on when the receiver genuinely runs on the same host
+    /// or a private network.
+    #[serde(default)]
+    pub webhook_allow_private_targets: bool,
+
+    /// Prefix for every key this deployment writes to Redis. Two deployments sharing one Redis
+    /// need different prefixes; so do tests, which is the other reason it exists.
+    #[serde(default = "default_redis_key_prefix")]
+    pub redis_key_prefix: String,
 }
 
 /// The subset of configuration the email adapters require. Plain data: it is derived from
@@ -153,6 +190,9 @@ impl AppConfig {
         if self.submission_per_form_rate_limit_per_minute == 0 {
             invalid.push("SUBMISSION_PER_FORM_RATE_LIMIT_PER_MINUTE must be greater than zero");
         }
+        if self.webhook_timeout_seconds == 0 {
+            invalid.push("WEBHOOK_TIMEOUT_SECONDS must be greater than zero");
+        }
         if self.access_token_ttl_seconds == 0 {
             invalid.push("ACCESS_TOKEN_TTL_SECONDS must be greater than zero");
         }
@@ -189,12 +229,29 @@ impl AppConfig {
             if self.email_from.as_deref().is_none_or(str::is_empty) {
                 invalid.push("EMAIL_FROM is required when EMAIL_PROVIDER=smtp");
             }
+            // A blank value means "no authentication", so half a pair is a mistake rather than
+            // an unusual setup: a username with no password is not a relay that anyone runs.
+            if self.smtp_username.is_some() != self.smtp_password.is_some() {
+                invalid.push("SMTP_USERNAME and SMTP_PASSWORD must be set together");
+            }
         }
         if !matches!(
             self.smtp_tls_mode.trim().to_ascii_lowercase().as_str(),
             "starttls" | "implicit" | "tls" | "none"
         ) {
             invalid.push("SMTP_TLS_MODE must be starttls, implicit, or none");
+        }
+
+        // Half a credential pair is a mistake rather than an unusual setup. Leaving both blank is
+        // legitimate: the SDK then uses its own chain, which is how an instance role works.
+        if self.s3_access_key_id.is_some() != self.s3_secret_access_key.is_some() {
+            invalid.push("S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY must be set together");
+        }
+        if self.upload_max_bytes == 0 {
+            invalid.push("UPLOAD_MAX_BYTES must be greater than zero");
+        }
+        if self.upload_ttl_hours == 0 {
+            invalid.push("UPLOAD_TTL_HOURS must be greater than zero");
         }
 
         if invalid.is_empty() {
@@ -305,6 +362,17 @@ impl AppConfig {
                     .into(),
             );
         }
+        if self
+            .s3_endpoint
+            .as_deref()
+            .is_some_and(|endpoint| endpoint.trim().starts_with("http://"))
+        {
+            warnings.push(
+                "S3_ENDPOINT is plain http while serving a non-loopback address: storage \
+                 credentials and every uploaded file travel unencrypted"
+                    .into(),
+            );
+        }
 
         warnings
     }
@@ -363,6 +431,28 @@ fn default_submission_per_form_rate_limit_per_minute() -> u32 {
     120
 }
 
+fn default_s3_region() -> String {
+    // R2 and several other providers ignore the region but still require one, and "auto" is
+    // what they document.
+    "auto".to_owned()
+}
+
+fn default_upload_max_bytes() -> u64 {
+    25 * 1024 * 1024
+}
+
+fn default_upload_ttl_hours() -> u64 {
+    24
+}
+
+fn default_webhook_timeout_seconds() -> u64 {
+    10
+}
+
+fn default_redis_key_prefix() -> String {
+    "submitsnap".to_owned()
+}
+
 fn default_access_token_ttl_seconds() -> u64 {
     900
 }
@@ -416,6 +506,28 @@ mod tests {
                 "a-development-secret-that-is-long-enough".into(),
             ),
         ]
+    }
+
+    #[test]
+    fn half_of_an_smtp_credential_pair_is_refused() {
+        let mut settings = base_settings();
+        settings.push(("email_provider", "smtp".into()));
+        settings.push(("smtp_host", "smtp.example.com".into()));
+        settings.push(("email_from", "hello@example.com".into()));
+        settings.push(("smtp_username", "mailer".into()));
+
+        let error = AppConfig::from_settings(settings).unwrap_err().to_string();
+        assert!(error.contains("SMTP_USERNAME and SMTP_PASSWORD"), "{error}");
+    }
+
+    #[test]
+    fn an_smtp_relay_without_credentials_is_accepted() {
+        let mut settings = base_settings();
+        settings.push(("email_provider", "smtp".into()));
+        settings.push(("smtp_host", "smtp.example.com".into()));
+        settings.push(("email_from", "hello@example.com".into()));
+
+        assert!(AppConfig::from_settings(settings).is_ok());
     }
 
     #[test]

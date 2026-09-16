@@ -21,11 +21,16 @@ SubmitSnap Cloud will be an optional managed offering built around this project.
 - Per-account login lockout plus per-IP request limiting
 - Role-based authorization with instance-wide `user` and `admin` roles
 - Organizations with `owner`, `admin`, and `member` roles, so resources can be managed per tenant
+- Forms with a validated field schema, a draft/published/closed lifecycle, and a rotatable public handle
+- Public submission ingestion with a honeypot, per-form rate limiting, and open CORS
+- A submission inbox with status changes, deletion, and streaming CSV/JSON export
+- Optional file uploads to any S3-compatible storage, streamed through the service so size and type limits describe the real file
+- Transactional outbox, notification email, and signed webhook delivery with retries and a delivery log
 - Append-only audit trail of authentication and authorization events, naming the actor, the subject, and the organization
 - Bearer-token login for API clients and HttpOnly cookie login for the dashboard
 - OpenAPI document and Swagger UI generated from the handlers
 - Local SMTP delivery with STARTTLS, implicit TLS, or explicit plaintext
-- Docker Compose for local PostgreSQL and Redis
+- Docker Compose for local PostgreSQL, Redis, and MinIO (the last only for file uploads)
 
 ## Quick start
 
@@ -45,11 +50,11 @@ cargo install sqlx-cli --no-default-features --features rustls,postgres
 sqlx migrate run
 ```
 
-Run the API and email worker in separate terminals:
+Run the API and the background worker in separate terminals:
 
 ```bash
 cargo run
-cargo run --bin email_worker
+cargo run --bin worker
 ```
 
 The `Makefile` wraps the same steps, loading values from `.env`:
@@ -58,7 +63,7 @@ The `Makefile` wraps the same steps, loading values from `.env`:
 make            # list every target
 make bootstrap  # start PostgreSQL and Redis, then rebuild the database from migrations
 make run        # API server
-make worker     # email worker
+make worker     # background worker: email, outbox dispatch, webhook delivery
 ```
 
 The API is available at `http://127.0.0.1:8080`. `GET /health` verifies PostgreSQL and Redis connectivity, and `GET /docs` serves the interactive OpenAPI reference.
@@ -158,6 +163,7 @@ These sit at the root, deliberately outside `/api/v1`:
 | --- | --- |
 | `GET /f/{public_id}` | The definition to render: title, description, and fields. Never the organization. Briefly cacheable. |
 | `POST /f/{public_id}` | A submission. |
+| `POST /f/{public_id}/files/{field_key}` | A file answer. See [File uploads](#file-uploads). |
 
 A form is embedded on somebody else's site by design, so three things are true of these routes and not of the API:
 
@@ -166,6 +172,124 @@ A form is embedded on somebody else's site by design, so three things are true o
 - **They have their own budgets.** A per-caller-IP limit plus a per-form limit, the latter so a flood aimed at one tenant does not consume anybody else's.
 
 A submission is validated against the stored definition and every problem is reported at once, not one at a time. Unknown keys are rejected; keys beginning with `_` are reserved for client-side helpers and dropped. If a honeypot field is filled, the submission is accepted exactly as normal and filed as `spam`, so the bot learns nothing.
+
+### File uploads
+
+Optional, and any S3-compatible storage works: Cloudflare R2, AWS S3, MinIO, Backblaze B2. With no `S3_BUCKET` set, everything still works except that a form containing a file field cannot be published — refused at the moment it would start accepting input, rather than silently dropping answers later.
+
+| Method + path | Required |
+| --- | --- |
+| `POST /f/{public_id}/files/{field_key}?filename=receipt.png` | public — returns the `key` to submit as the answer |
+| `GET /organizations/{org}/submissions/{id}/files/{field_key}` | member — streamed back as an attachment |
+
+**Bytes travel through this service rather than straight to the bucket.** A presigned URL would never show Core the file, so `max_bytes` and the field's `accept` list would only ever validate what a client *claimed*. Here the real size is counted as it arrives and the real leading bytes are inspected, and the checks are enforced by streaming rather than by buffering the file in memory.
+
+That choice has three consequences worth knowing:
+
+- **The bucket needs no CORS configuration and can stay entirely private.** Nothing but Core ever talks to it.
+- **Uploads cost this service bandwidth.** That is the price of enforcement, and it is the right way round for a self-hosted deployment.
+- **A download never renders inline.** Responses carry `Content-Disposition: attachment` and `X-Content-Type-Options: nosniff`, so an uploaded HTML or SVG file cannot run script against this API's own origin. The object key is read from the submission, which is scoped to the organization — an unguessable key is not itself a capability.
+
+An upload that no submission claims is deleted by the worker after `UPLOAD_TTL_HOURS`, so attaching a file and closing the tab does not leave it in the bucket forever. Give the bucket an `AbortIncompleteMultipartUpload` lifecycle rule as well: if the process is killed mid-upload, nothing here gets the chance to abort it.
+
+### The submission inbox
+
+| Method + path | Required |
+| --- | --- |
+| `GET /organizations/{org}/submissions` | member — every form in the organization |
+| `GET /organizations/{org}/forms/{id}/submissions` | member |
+| `GET /organizations/{org}/submissions/{id}` | member |
+| `PATCH /organizations/{org}/submissions/{id}` | owner, admin — status |
+| `DELETE /organizations/{org}/submissions/{id}` | owner, admin |
+| `GET /organizations/{org}/submissions/{id}/files/{field_key}` | member — the attachment, streamed |
+| `GET /organizations/{org}/forms/{id}/submissions/export?format=csv\|json` | member |
+
+Listings filter by `status`, `since`, `until`, and the value of any answer: `field=topic&value=Support`. That last one is a JSON containment query, which is exactly what the GIN index over the answer document is there for — so filtering by a field the schema knows nothing about is still indexed.
+
+The export reads in batches and writes each one out as it goes, so the size of a form is not the size of the response in memory. Its columns are the form's current fields *plus* every key ever stored, so an export taken after the definition changed still carries answers that no longer have a field.
+
+Exports page by keyset rather than `OFFSET`: `OFFSET` rescans everything already sent, so the last page of a large form would cost more than the whole export. Continuing after the last row seen keeps it one index scan.
+
+### Delivery tables
+
+Two tables carry the work that happens after a request has been answered: `outbox_events` is what this instance owes, and `webhook_deliveries` is one attempt at telling a particular endpoint about it. Both are written by the same statement as the submission they describe.
+
+They are split because the two things fail differently. An outbox event is settled once the work has been handed off; a delivery is retried on its own schedule against a receiver that may be down for hours. Keeping them together would mean retrying the SMTP handshake because a webhook receiver was slow.
+
+### Notifications and webhooks
+
+A submission is written, and the fact that somebody must be told is written **in the same statement**. That is the whole design: there is no window in which a submission exists and its notification does not, and no reconciliation job is needed to find one.
+
+`--bin worker` runs three loops side by side. They are independent on purpose — a queue that is down must not stop webhooks, and a slow receiver must not stop mail.
+
+| Loop | Does |
+| --- | --- |
+| **email** | Drains the Redis queue and talks SMTP. |
+| **outbox** | Claims owed events and turns each into an email job and its webhook deliveries. |
+| **webhooks** | Sends the deliveries, signed, with retries. |
+| **uploads** | Deletes uploads that no submission ever claimed. |
+
+**The outbox is at-least-once.** Every step is ordered so the failure mode is the cheap one: the webhook fan-out runs first and is idempotent, and the email is enqueued last. A crash in the narrow window between enqueuing mail and settling the event can therefore send a notification email twice. That is deliberate — a duplicate notification is a nuisance, a lost one is a bug report.
+
+Work is reserved by **leasing** rather than locking: claiming pushes `available_at` past a window in one statement, so several workers run at once without holding a database connection open for the length of an SMTP handshake. A failure is rescheduled with a widening delay (5s → 1h) and never dropped; the error stays on the row for an operator to read.
+
+Webhook endpoints are per organization and may be narrowed to one form. An endpoint that answers a non-2xx is retried on its own schedule (10s → 2h) and given up on after 6 attempts, which leaves the row in the log for a manual redelivery.
+
+| Method + path | Required |
+| --- | --- |
+| `POST /organizations/{org}/webhook-endpoints` | owner, admin — returns the secret, once |
+| `GET /organizations/{org}/webhook-endpoints` | member |
+| `GET`/`PATCH`/`DELETE /organizations/{org}/webhook-endpoints/{id}` | member to read, owner/admin to change |
+| `POST /organizations/{org}/webhook-endpoints/{id}/rotate-secret` | owner, admin |
+| `GET /organizations/{org}/webhook-deliveries` | member |
+| `POST /organizations/{org}/webhook-deliveries/{id}/redeliver` | owner, admin |
+
+A signing secret is handed out once, at creation or rotation, and is never listed again — a secret that can be listed leaks with a support ticket.
+
+#### Verifying a delivery
+
+A receiver gets three headers and the raw body:
+
+```
+X-SubmitSnap-Signature: sha256=<hex>
+X-SubmitSnap-Timestamp: 1758000000
+X-SubmitSnap-Delivery:  <delivery uuid>
+```
+
+The signature is HMAC-SHA256 over **`<timestamp>.<raw body>`** — the timestamp is inside what was signed, so a captured request cannot be replayed later. Reject anything older than a few minutes, and compare in constant time:
+
+```python
+import hmac, hashlib, time
+
+def verify(secret: str, timestamp: str, body: bytes, signature: str) -> bool:
+    if abs(time.time() - int(timestamp)) > 300:
+        return False
+    expected = hmac.new(
+        secret.encode(), f"{timestamp}.".encode() + body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(signature, f"sha256={expected}")
+```
+
+The body is sent as the exact bytes that were signed. Re-serializing it before comparing will produce a different string and break the check.
+
+The payload looks like this:
+
+```json
+{
+  "event": "submission.received",
+  "form": { "id": "…", "name": "Contact us" },
+  "submission": {
+    "id": "…", "status": "unread", "created_at": "…",
+    "data": { "email": "person@example.com" }
+  }
+}
+```
+
+#### Where an endpoint may point
+
+A webhook URL is fetched **by this server**, which makes the link-local range — where cloud instance credentials live — reachable by anyone who can administer an organization. Literal loopback and link-local targets are therefore refused.
+
+This is a check against the obvious mistake, not a defence against a determined one: the host is examined as written rather than as resolved, so a hostname that resolves somewhere private gets through. Set `WEBHOOK_ALLOW_PRIVATE_TARGETS=true` when the receiver genuinely runs on the same host or a private network. Treat an organization's owner and admins as trusted.
 
 ### The scoping rule for tables that come next
 
@@ -282,6 +406,7 @@ src/modules/
   rbac/          instance roles and grants
   organization/  tenants, membership, and the access checks over them
   form/          forms, the definition contract, and public ingestion
+  webhook/       endpoints, signed delivery, and the delivery log
 ```
 
 Dependencies flow one way: `auth` depends on `identity` and `session`; `identity` depends on `session` and `rbac`; `organization` depends on `identity`. The shared `ApiState` lives at the module root, so a new route module never has to borrow another module's state to reach the `AuthenticatedUser` extractor.
@@ -303,8 +428,9 @@ A submission must be stored transactionally before any asynchronous work is acce
 - [x] Organizations with `owner`, `admin`, and `member` roles
 - [x] Form model, scoped to an organization, with schema validation and a rotation-able public handle
 - [x] Public `GET`/`POST /f/:public_form_id` ingestion
-- [ ] Submission inbox, status changes, and CSV/JSON export
-- [ ] Transactional outbox and reliable webhook/email delivery
+- [x] Submission inbox, status changes, and CSV/JSON export
+- [x] Transactional outbox, notification email, and signed webhook delivery
+- [x] Optional S3-compatible file uploads and streamed downloads
 - [ ] JavaScript SDK and React hooks
 - [ ] Dashboard integration
 - [ ] First-party (TOTP) and passkey second factors
@@ -323,6 +449,14 @@ Integration tests use `#[sqlx::test]`, which creates a disposable database and a
 ```bash
 make test        # or: DATABASE_URL=... cargo test
 ```
+
+Two groups are exceptions, because the thing under test *is* the external service. The dispatch tests need the Redis from `compose.yaml` (each under a key prefix of its own, so they never see each other's jobs), and `tests/uploads.rs` needs the MinIO from it. Both are in `make up`:
+
+```bash
+make up && make test
+```
+
+`tests/uploads.rs` inspects the bucket directly rather than inferring storage behaviour from the database. "A refused upload leaves nothing behind" is a claim about the bucket, so that is where it is asserted.
 
 ## Contributing and security
 

@@ -68,6 +68,11 @@ pub fn print(startup: Startup<'_>) {
         paint.dim(&redact_url(&config.redis_url))
     );
     println!("  {:<10} {}", paint.bold("Email"), email_summary(config));
+    println!(
+        "  {:<10} {}",
+        paint.bold("Storage"),
+        storage_summary(config, &paint)
+    );
 
     println!();
     println!("  {}", paint.dim(&summary_line(config)));
@@ -87,6 +92,31 @@ fn email_summary(config: &AppConfig) -> String {
         config.smtp_port,
         config.smtp_tls_mode.to_ascii_lowercase()
     )
+}
+
+fn storage_summary(config: &AppConfig, paint: &Painter) -> String {
+    if !config.file_uploads_enabled() {
+        return paint.dim("disabled (file fields cannot be published)");
+    }
+
+    let bucket = config.s3_bucket.as_deref().unwrap_or("unset").trim();
+    let destination = match config
+        .s3_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+    {
+        Some(endpoint) => format!("{bucket} via {endpoint}"),
+        None => bucket.to_owned(),
+    };
+
+    // Plain http would put both the credentials and the files on the wire in the clear, which is
+    // reasonable for a local MinIO and alarming anywhere else.
+    if destination.contains("http://") {
+        format!("{destination} {}", paint.yellow("(unencrypted)"))
+    } else {
+        destination
+    }
 }
 
 fn summary_line(config: &AppConfig) -> String {
@@ -157,6 +187,10 @@ impl Painter {
 
     fn red(&self, text: &str) -> String {
         self.paint("31", text)
+    }
+
+    fn yellow(&self, text: &str) -> String {
+        self.paint("33", text)
     }
 
     fn bold_cyan(&self, text: &str) -> String {

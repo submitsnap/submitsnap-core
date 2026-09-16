@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     config.log_deployment_warnings();
 
     let database = db::connect(&config).await?;
-    let queue = EmailQueue::connect(&config.redis_url)?;
+    let queue = EmailQueue::connect(&config.redis_url, &config.redis_key_prefix)?;
     let state = AppState::new(Arc::new(config), database, queue);
 
     let listener = tokio::net::TcpListener::bind(state.config.bind_address()?).await?;

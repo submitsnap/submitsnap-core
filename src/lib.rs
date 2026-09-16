@@ -1,9 +1,10 @@
+pub mod dispatcher;
 pub mod modules;
 pub mod openapi;
 pub mod shared;
 
 use axum::{Router, routing::get};
-use tower_http::trace::TraceLayer;
+use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 use utoipa::OpenApi as _;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -14,6 +15,7 @@ use crate::{
         form::{public_router as form_public_router, router as form_router},
         identity::router as identity_router,
         organization::{admin_router as organization_admin_router, router as organization_router},
+        webhook::router as webhook_router,
     },
     shared::{health, ratelimit, security, state::AppState},
 };
@@ -35,10 +37,12 @@ pub fn app(state: AppState) -> anyhow::Result<Router> {
     let administration =
         auth_admin_router(api_state.clone()).merge(organization_admin_router(api_state.clone()));
 
-    // Organizations and their forms share a prefix but live in separate modules, which is what
-    // keeps the dependency running one way: form knows about organization, not the reverse.
-    let organizations =
-        organization_router(api_state.clone()).merge(form_router(api_state.clone()));
+    // Organizations, their forms, and their webhooks share a prefix but live in separate
+    // modules, which is what keeps the dependency running one way: form and webhook know about
+    // organization, not the reverse, and neither knows about the other.
+    let organizations = organization_router(api_state.clone())
+        .merge(form_router(api_state.clone()))
+        .merge(webhook_router(api_state.clone()));
 
     let api = Router::new()
         .nest("/auth", auth_router(api_state.clone()))
@@ -46,13 +50,17 @@ pub fn app(state: AppState) -> anyhow::Result<Router> {
         .nest("/organizations", organizations)
         .nest("/admin", administration);
 
-    // Everything under the API can return or establish a credential.
+    // Everything under the API can return or establish a credential, and every one of its routes
+    // takes a small JSON body.
+    let api = api.layer(RequestBodyLimitLayer::new(
+        state.config.request_body_limit_bytes,
+    ));
     let api = security::no_store(api);
     let api = security::api_cors(api, &state.config)?;
 
     // The public form endpoints are a different contract: cacheable, open to every origin, and
-    // holding their own tighter budget.
-    let public = form_public_router(api_state);
+    // holding their own tighter budget. Their one large-body route raises the limit itself.
+    let public = form_public_router(api_state, state.config.request_body_limit_bytes);
     let public = security::public_cors(public);
     let public = ratelimit::limit(public, state.rate_limiters.submissions.clone());
 

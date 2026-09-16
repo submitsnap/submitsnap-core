@@ -87,6 +87,33 @@ pub struct FieldDefinition {
     pub accept: Option<Vec<String>>,
 }
 
+impl FieldDefinition {
+    /// Whether this field accepts a media type.
+    ///
+    /// An `accept` list that was never set accepts anything, which is what a form author means by
+    /// leaving it blank.
+    pub fn accepts(&self, content_type: &str) -> bool {
+        let Some(accept) = self.accept.as_ref() else {
+            return true;
+        };
+
+        accept
+            .iter()
+            .any(|allowed| media_type_matches(allowed, content_type))
+    }
+}
+
+/// Compares one `accept` entry with a media type, honouring the `image/*` wildcard, because that
+/// is what a form author writes when they mean "any image".
+fn media_type_matches(allowed: &str, content_type: &str) -> bool {
+    let allowed = allowed.trim().to_ascii_lowercase();
+
+    match allowed.split_once('/') {
+        Some((kind, "*")) => content_type.split('/').next() == Some(kind),
+        _ => allowed == content_type,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FormSchema {

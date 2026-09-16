@@ -29,6 +29,10 @@ pub enum AppError {
     AccountLocked,
     #[error("too many requests")]
     TooManyRequests,
+    /// The request body exceeded a limit this route enforces. Distinct from `Validation` because
+    /// 413 is what a client's upload code needs to branch on.
+    #[error("{0}")]
+    PayloadTooLarge(String),
     #[error("internal server error")]
     Internal(#[from] anyhow::Error),
 }
@@ -53,6 +57,7 @@ impl AppError {
             Self::Conflict => StatusCode::CONFLICT,
             Self::AccountLocked => StatusCode::LOCKED,
             Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+            Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -68,6 +73,7 @@ impl AppError {
             Self::Conflict => "conflict",
             Self::AccountLocked => "account_locked",
             Self::TooManyRequests => "too_many_requests",
+            Self::PayloadTooLarge(_) => "payload_too_large",
             Self::Internal(_) => "internal_error",
         }
     }

@@ -40,6 +40,11 @@ pub enum AuthEventType {
     FormClosed,
     FormDeleted,
     FormPublicIdRotated,
+    SubmissionStatusChanged,
+    SubmissionDeleted,
+    WebhookEndpointCreated,
+    WebhookEndpointUpdated,
+    WebhookEndpointDeleted,
 }
 
 /// An audit record to append. Borrowed fields keep the call sites cheap.

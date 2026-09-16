@@ -104,14 +104,36 @@ fn smtp_transport(config: &EmailConfig) -> anyhow::Result<AsyncSmtpTransport<Tok
 
     builder = builder.port(config.smtp_port);
 
-    if let (Some(username), Some(password)) = (&config.smtp_username, &config.smtp_password) {
-        builder = builder.credentials(Credentials::new(
-            username.clone(),
-            password.expose_secret().to_owned(),
-        ));
+    // An empty value means "not configured", not "configured as empty". `.env.example` ships
+    // these blank, so treating them as credentials would make the documented setup path try to
+    // authenticate against a relay that has no authentication — and fail with an error about
+    // authentication mechanisms rather than about configuration.
+    let username = non_empty(config.smtp_username.as_deref());
+    let password = config
+        .smtp_password
+        .as_ref()
+        .map(ExposeSecret::expose_secret)
+        .map(str::trim)
+        .filter(|password| !password.is_empty());
+
+    match (username, password) {
+        (Some(username), Some(password)) => {
+            builder =
+                builder.credentials(Credentials::new(username.to_owned(), password.to_owned()));
+        }
+        // Nothing to authenticate with, so nothing is attempted. A relay that offers AUTH but
+        // is given no credentials is a misconfiguration, and saying so beats a handshake that
+        // fails with "no compatible authentication mechanism was found".
+        _ => {
+            builder = builder.authentication(Vec::new());
+        }
     }
 
     Ok(builder.build())
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn required<'a>(value: &'a Option<String>, setting: &str) -> anyhow::Result<&'a str> {
@@ -205,6 +227,27 @@ mod tests {
         assert_eq!("tls".parse::<SmtpTls>().unwrap(), SmtpTls::Implicit);
         assert_eq!("none".parse::<SmtpTls>().unwrap(), SmtpTls::None);
         assert!("ssl".parse::<SmtpTls>().is_err());
+    }
+
+    #[test]
+    fn a_blank_username_or_password_means_no_authentication() {
+        // `.env.example` ships both blank, and a relay that needs no credentials is ordinary.
+        // Treating a blank value as a credential made the documented setup path fail with
+        // "no compatible authentication mechanism was found".
+        assert_eq!(non_empty(Some("")), None);
+        assert_eq!(non_empty(Some("   ")), None);
+        assert_eq!(non_empty(Some("mailer\n")), Some("mailer"));
+        assert_eq!(non_empty(None), None);
+
+        let config = EmailConfig {
+            smtp_username: Some(String::new()),
+            smtp_password: Some(SecretString::from(String::new())),
+            ..smtp_config()
+        };
+        assert!(
+            EmailClient::from_config(&config).is_ok(),
+            "a blank pair is a relay without authentication, not a broken one"
+        );
     }
 
     #[test]

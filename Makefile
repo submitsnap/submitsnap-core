@@ -72,8 +72,8 @@ bootstrap: up db-reset ## Start the services and rebuild the database from scrat
 run: ## Run the API server
 	$(CARGO) run
 
-worker: ## Run the email worker
-	$(CARGO) run --bin email_worker
+worker: ## Run the background worker (email, outbox, webhooks)
+	$(CARGO) run --bin worker
 
 check-email: ## Send one test message through the configured SMTP server (TO=you@example.com)
 	@test -n '$(TO)' || { \

@@ -6,7 +6,6 @@ use axum::{
 };
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
-    limit::RequestBodyLimitLayer,
     set_header::SetResponseHeaderLayer,
     timeout::TimeoutLayer,
 };
@@ -19,6 +18,11 @@ use crate::shared::config::AppConfig;
 /// CORS is deliberately *not* applied here. There are two different policies — the API's
 /// allowlist and the wide-open one the public form endpoints need — and a single layer over the
 /// whole router would let the outer one overwrite the inner one's headers.
+///
+/// The body limit is *not* applied here either, for the same kind of reason: a limit applied
+/// around the whole router can only be lowered by anything inside it, and the upload route needs
+/// a much larger allowance than every other route. [`crate::build_router`] applies it per subtree
+/// instead.
 pub fn transport<S>(router: Router<S>, config: &AppConfig) -> anyhow::Result<Router<S>>
 where
     S: Clone + Send + Sync + 'static,
@@ -27,7 +31,6 @@ where
         .layer(header_layer(header::X_CONTENT_TYPE_OPTIONS, "nosniff"))
         .layer(header_layer(header::X_FRAME_OPTIONS, "DENY"))
         .layer(header_layer(header::REFERRER_POLICY, "no-referrer"))
-        .layer(RequestBodyLimitLayer::new(config.request_body_limit_bytes))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(config.request_timeout_seconds),

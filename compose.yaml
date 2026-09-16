@@ -25,5 +25,44 @@ services:
       timeout: 5s
       retries: 10
 
+  # Optional, and only for development: it stands in for whatever S3-compatible storage a
+  # deployment uses. Without S3_BUCKET set in .env the product runs fine and file fields simply
+  # cannot be published, so nothing here is required to work on the rest of the service.
+  minio:
+    image: quay.io/minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: submitsnap
+      MINIO_ROOT_PASSWORD: submitsnap-dev-secret
+    ports:
+      - "9499:9000"
+      - "9498:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - minio_data:/data
+
+  # MinIO does not create buckets on its own, and a missing bucket is a confusing failure at the
+  # first upload rather than at startup. This runs once and exits.
+  #
+  # Production buckets should also carry an `AbortIncompleteMultipartUpload` lifecycle rule. A
+  # multi-part upload abandoned mid-flight — the process killed, the pod rescheduled — never
+  # reaches the code that would abort it, so the bucket is the only backstop for that case.
+  # MinIO sweeps these on its own, which is why nothing is configured for it here.
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 submitsnap submitsnap-dev-secret &&
+      mc mb --ignore-existing local/submitsnap-uploads
+      "
+
 volumes:
   postgres_data:
+  minio_data:
