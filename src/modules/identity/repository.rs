@@ -180,12 +180,15 @@ impl UserRepository {
 
     /// Removes an account. Sessions, refresh tokens, and role grants cascade away; audit rows
     /// survive with their account reference cleared, which is what an audit trail should do.
+    ///
+    /// The database refuses the delete when the account is the last owner of an organization,
+    /// so an instance administrator cannot strand a tenant.
     pub async fn delete(&self, id: Uuid) -> Result<bool, IdentityError> {
         let outcome = sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(id)
             .execute(&self.database)
             .await
-            .map_err(internal)?;
+            .map_err(map_delete_error)?;
 
         Ok(outcome.rows_affected() > 0)
     }
@@ -313,8 +316,27 @@ impl UserRepository {
     }
 }
 
+/// SQLSTATE raised by `prevent_orphaned_organization`, deliberately distinct so this path does
+/// not have to guess from a generic message.
+const LAST_ORGANIZATION_OWNER: &str = "SS001";
+
 fn internal(error: sqlx::Error) -> IdentityError {
     IdentityError::Internal(error.into())
+}
+
+/// Turns the orphan-prevention trigger's refusal into a domain error, so the caller answers with
+/// a clear 400 instead of a generic internal failure.
+fn map_delete_error(error: sqlx::Error) -> IdentityError {
+    // Owned, so the borrow of `error` ends before it is moved below.
+    let message = error
+        .as_database_error()
+        .filter(|database_error| database_error.code().as_deref() == Some(LAST_ORGANIZATION_OWNER))
+        .map(|database_error| database_error.message().to_owned());
+
+    match message {
+        Some(message) => IdentityError::LastOrganizationOwner(message),
+        None => internal(error),
+    }
 }
 
 /// Translates the case-insensitive email uniqueness violation into a domain error.

@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -45,11 +45,7 @@ pub struct Access {
 impl Access {
     /// Fails unless the caller may change the organization or its membership.
     pub fn require_manager(&self) -> Result<(), OrganizationError> {
-        if self.role.is_manager() {
-            Ok(())
-        } else {
-            Err(OrganizationError::InsufficientRole)
-        }
+        require_manager(self.role)
     }
 
     /// Fails unless the caller owns the organization.
@@ -61,17 +57,30 @@ impl Access {
         }
     }
 
-    /// Fails unless the caller's role can reach an account holding `other`.
-    pub fn require_reaches(&self, other: OrganizationRole) -> Result<(), OrganizationError> {
-        if self.role.reaches(other) {
-            Ok(())
-        } else {
-            Err(OrganizationError::InsufficientRole)
-        }
-    }
-
     pub fn response(&self) -> OrganizationResponse {
         OrganizationResponse::new(&self.organization, self.member_count, self.role)
+    }
+}
+
+/// Authorization for the membership operations, which read the role inside their transaction
+/// rather than resolving an [`Access`] beforehand.
+fn require_manager(role: OrganizationRole) -> Result<(), OrganizationError> {
+    if role.is_manager() {
+        Ok(())
+    } else {
+        Err(OrganizationError::InsufficientRole)
+    }
+}
+
+/// Fails unless `role` can reach an account holding `other`.
+fn require_reaches(
+    role: OrganizationRole,
+    other: OrganizationRole,
+) -> Result<(), OrganizationError> {
+    if role.reaches(other) {
+        Ok(())
+    } else {
+        Err(OrganizationError::InsufficientRole)
     }
 }
 
@@ -253,29 +262,43 @@ impl OrganizationService {
         actor_id: Uuid,
         client: &ClientInfo,
     ) -> Result<(OrganizationMemberResponse, bool), OrganizationError> {
-        let access = self.access(organization_id, actor_id).await?;
-        access.require_manager()?;
-        access.require_reaches(request.role)?;
-
         let Some(user_id) = self.identity.user_id_by_email(&request.email).await? else {
             return Err(OrganizationError::AccountNotFound);
         };
 
-        let existing = self.organizations.role_of(organization_id, user_id).await?;
+        let mut transaction = self.organizations.begin().await?;
+        self.organizations
+            .lock(&mut *transaction, organization_id)
+            .await?;
+
+        let actor_role = self
+            .locked_role(&mut transaction, organization_id, actor_id)
+            .await?;
+        require_manager(actor_role)?;
+        require_reaches(actor_role, request.role)?;
+
+        let existing = self
+            .organizations
+            .role_of(&mut *transaction, organization_id, user_id)
+            .await?;
 
         if let Some(current) = existing {
-            access.require_reaches(current)?;
+            require_reaches(actor_role, current)?;
             if current == request.role {
+                // Nothing to change, so nothing to write and nothing to audit.
+                transaction.commit().await?;
                 return Ok((self.member(organization_id, user_id).await?, false));
             }
             if current.is_owner() {
-                self.ensure_another_owner(organization_id).await?;
+                self.ensure_another_owner(&mut transaction, organization_id)
+                    .await?;
             }
         }
 
         self.organizations
-            .upsert_member(organization_id, user_id, request.role)
+            .upsert_member(&mut *transaction, organization_id, user_id, request.role)
             .await?;
+        transaction.commit().await?;
 
         let member = self.member(organization_id, user_id).await?;
         self.audit(
@@ -303,29 +326,39 @@ impl OrganizationService {
         actor_id: Uuid,
         client: &ClientInfo,
     ) -> Result<OrganizationMemberResponse, OrganizationError> {
-        let access = self.access(organization_id, actor_id).await?;
-        access.require_manager()?;
+        let mut transaction = self.organizations.begin().await?;
+        self.organizations
+            .lock(&mut *transaction, organization_id)
+            .await?;
+
+        let actor_role = self
+            .locked_role(&mut transaction, organization_id, actor_id)
+            .await?;
+        require_manager(actor_role)?;
 
         let current = self
             .organizations
-            .role_of(organization_id, target_id)
+            .role_of(&mut *transaction, organization_id, target_id)
             .await?
             .ok_or(OrganizationError::MemberNotFound)?;
 
-        access.require_reaches(current)?;
-        access.require_reaches(role)?;
+        require_reaches(actor_role, current)?;
+        require_reaches(actor_role, role)?;
 
         if current == role {
+            transaction.commit().await?;
             return self.member(organization_id, target_id).await;
         }
 
         if current.is_owner() {
-            self.ensure_another_owner(organization_id).await?;
+            self.ensure_another_owner(&mut transaction, organization_id)
+                .await?;
         }
 
         self.organizations
-            .upsert_member(organization_id, target_id, role)
+            .upsert_member(&mut *transaction, organization_id, target_id, role)
             .await?;
+        transaction.commit().await?;
 
         let member = self.member(organization_id, target_id).await?;
         self.audit(
@@ -349,28 +382,37 @@ impl OrganizationService {
         actor_id: Uuid,
         client: &ClientInfo,
     ) -> Result<(), OrganizationError> {
-        let access = self.access(organization_id, actor_id).await?;
+        let mut transaction = self.organizations.begin().await?;
+        self.organizations
+            .lock(&mut *transaction, organization_id)
+            .await?;
+
+        let actor_role = self
+            .locked_role(&mut transaction, organization_id, actor_id)
+            .await?;
 
         let current = self
             .organizations
-            .role_of(organization_id, target_id)
+            .role_of(&mut *transaction, organization_id, target_id)
             .await?
             .ok_or(OrganizationError::MemberNotFound)?;
 
         // Leaving is always allowed; acting on somebody else needs the standing to do it.
         if target_id != actor_id {
-            access.require_manager()?;
-            access.require_reaches(current)?;
+            require_manager(actor_role)?;
+            require_reaches(actor_role, current)?;
         }
 
         if current.is_owner() {
-            self.ensure_another_owner(organization_id).await?;
+            self.ensure_another_owner(&mut transaction, organization_id)
+                .await?;
         }
 
         let member = self.member(organization_id, target_id).await?;
         self.organizations
-            .remove_member(organization_id, target_id)
+            .remove_member(&mut *transaction, organization_id, target_id)
             .await?;
+        transaction.commit().await?;
 
         self.audit(
             AuthEventType::OrganizationMemberRemoved,
@@ -421,9 +463,35 @@ impl OrganizationService {
             .ok_or(OrganizationError::MemberNotFound)
     }
 
+    /// The caller's role, read *inside* the transaction that is about to act on it, so a role
+    /// revoked a moment ago cannot still be used.
+    async fn locked_role(
+        &self,
+        transaction: &mut Transaction<'static, Postgres>,
+        organization_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<OrganizationRole, OrganizationError> {
+        self.organizations
+            .role_of(&mut **transaction, organization_id, user_id)
+            .await?
+            .ok_or(OrganizationError::NotAMember)
+    }
+
     /// Refuses a change that would leave the organization with no owner.
-    async fn ensure_another_owner(&self, organization_id: Uuid) -> Result<(), OrganizationError> {
-        if self.organizations.owner_count(organization_id).await? <= 1 {
+    ///
+    /// Called with the organization already locked, which is what makes the count meaningful:
+    /// nothing else can change the membership between this read and the write it guards.
+    async fn ensure_another_owner(
+        &self,
+        transaction: &mut Transaction<'static, Postgres>,
+        organization_id: Uuid,
+    ) -> Result<(), OrganizationError> {
+        if self
+            .organizations
+            .owner_count(&mut **transaction, organization_id)
+            .await?
+            <= 1
+        {
             return Err(OrganizationError::LastOwner);
         }
 

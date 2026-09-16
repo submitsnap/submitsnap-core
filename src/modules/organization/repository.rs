@@ -1,4 +1,4 @@
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::modules::organization::{
@@ -86,17 +86,45 @@ impl OrganizationRepository {
         .map_err(Into::into)
     }
 
-    pub async fn role_of(
+    /// Opens a transaction for a membership change, so the last-owner check and the write it
+    /// guards cannot be interleaved with another request.
+    pub async fn begin(&self) -> Result<Transaction<'static, Postgres>, OrganizationError> {
+        Ok(self.database.begin().await?)
+    }
+
+    /// Locks the organization for the rest of the transaction.
+    ///
+    /// This is what makes the last-owner rule hold under concurrency: without it, two requests
+    /// each removing a different owner both read "there are two owners", both pass the check,
+    /// and the organization is left with none.
+    pub async fn lock<'e, E>(&self, executor: E, id: Uuid) -> Result<(), OrganizationError>
+    where
+        E: PgExecutor<'e>,
+    {
+        let locked: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM organizations WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(executor)
+                .await?;
+
+        locked.map(|_| ()).ok_or(OrganizationError::NotFound)
+    }
+
+    pub async fn role_of<'e, E>(
         &self,
+        executor: E,
         organization_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Option<OrganizationRole>, OrganizationError> {
+    ) -> Result<Option<OrganizationRole>, OrganizationError>
+    where
+        E: PgExecutor<'e>,
+    {
         sqlx::query_scalar(
             "SELECT role FROM organization_members WHERE organization_id = $1 AND user_id = $2",
         )
         .bind(organization_id)
         .bind(user_id)
-        .fetch_optional(&self.database)
+        .fetch_optional(executor)
         .await
         .map_err(Into::into)
     }
@@ -204,12 +232,16 @@ impl OrganizationRepository {
     }
 
     /// Adds an account to the organization, or updates its role when it is already a member.
-    pub async fn upsert_member(
+    pub async fn upsert_member<'e, E>(
         &self,
+        executor: E,
         organization_id: Uuid,
         user_id: Uuid,
         role: OrganizationRole,
-    ) -> Result<(), OrganizationError> {
+    ) -> Result<(), OrganizationError>
+    where
+        E: PgExecutor<'e>,
+    {
         sqlx::query(
             "INSERT INTO organization_members (organization_id, user_id, role) \
              VALUES ($1, $2, $3) \
@@ -218,35 +250,46 @@ impl OrganizationRepository {
         .bind(organization_id)
         .bind(user_id)
         .bind(role)
-        .execute(&self.database)
+        .execute(executor)
         .await?;
 
         Ok(())
     }
 
-    pub async fn remove_member(
+    pub async fn remove_member<'e, E>(
         &self,
+        executor: E,
         organization_id: Uuid,
         user_id: Uuid,
-    ) -> Result<bool, OrganizationError> {
+    ) -> Result<bool, OrganizationError>
+    where
+        E: PgExecutor<'e>,
+    {
         let outcome = sqlx::query(
             "DELETE FROM organization_members WHERE organization_id = $1 AND user_id = $2",
         )
         .bind(organization_id)
         .bind(user_id)
-        .execute(&self.database)
+        .execute(executor)
         .await?;
 
         Ok(outcome.rows_affected() > 0)
     }
 
-    pub async fn owner_count(&self, organization_id: Uuid) -> Result<i64, OrganizationError> {
+    pub async fn owner_count<'e, E>(
+        &self,
+        executor: E,
+        organization_id: Uuid,
+    ) -> Result<i64, OrganizationError>
+    where
+        E: PgExecutor<'e>,
+    {
         sqlx::query_scalar(
             "SELECT count(*) FROM organization_members \
              WHERE organization_id = $1 AND role = 'owner'::organization_role",
         )
         .bind(organization_id)
-        .fetch_one(&self.database)
+        .fetch_one(executor)
         .await
         .map_err(Into::into)
     }

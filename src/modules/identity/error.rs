@@ -28,6 +28,10 @@ pub enum IdentityError {
     UnknownRole(String),
     #[error("the confirmation address does not match the account")]
     ConfirmationMismatch,
+    /// Raised by the database when deleting the account would leave an organization with no
+    /// owner. The message names the organizations.
+    #[error("{0}")]
+    LastOrganizationOwner(String),
     #[error("internal identity error")]
     Internal(#[from] anyhow::Error),
 }
@@ -52,6 +56,7 @@ impl From<IdentityError> for AppError {
             IdentityError::SelfTargeted => Self::Validation(error.to_string()),
             IdentityError::UnknownRole(role) => Self::Validation(format!("unknown role: {role}")),
             IdentityError::ConfirmationMismatch => Self::Validation(error.to_string()),
+            IdentityError::LastOrganizationOwner(message) => Self::Validation(message),
             IdentityError::Internal(error) => Self::Internal(error),
         }
     }

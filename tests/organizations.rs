@@ -554,6 +554,113 @@ async fn every_membership_change_is_audited_with_its_organization_and_actor(pool
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn an_account_cannot_be_deleted_while_it_is_a_last_owner(pool: PgPool) {
+    let app = TestApp::new(pool.clone());
+    let (owner_id, owner) = account(&app, "owner@example.com").await;
+    let organization_id = create_organization(&app, &owner, "Acme").await;
+    let administrator = administrator(&app, &pool, "root@example.com").await;
+
+    // Deleting the only owner would leave the organization with nobody able to manage it, and
+    // with no API path back, so the database refuses it.
+    let (status, body) = app
+        .delete_json_auth(
+            &format!("/api/v1/admin/users/{owner_id}"),
+            json!({ "confirm_email": "owner@example.com" }),
+            &administrator,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("Acme"),
+        "the refusal names the organization: {body}"
+    );
+
+    // Nothing was half-deleted.
+    assert_eq!(
+        app.get_auth(&path(organization_id), &owner).await.0,
+        StatusCode::OK
+    );
+
+    // With a successor in place the same deletion goes through.
+    account(&app, "successor@example.com").await;
+    grant_org_role(
+        &app,
+        &owner,
+        organization_id,
+        "successor@example.com",
+        "owner",
+    )
+    .await;
+
+    let (status, _) = app
+        .delete_json_auth(
+            &format!("/api/v1/admin/users/{owner_id}"),
+            json!({ "confirm_email": "owner@example.com" }),
+            &administrator,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn concurrent_removals_cannot_leave_an_organization_without_an_owner(pool: PgPool) {
+    let app = TestApp::new(pool.clone());
+    let (first_id, first) = account(&app, "first@example.com").await;
+    let (second_id, second) = account(&app, "second@example.com").await;
+    let organization_id = create_organization(&app, &first, "Acme").await;
+    grant_org_role(&app, &first, organization_id, "second@example.com", "owner").await;
+
+    let first_path = format!("{}/members/{first_id}", path(organization_id));
+    let second_path = format!("{}/members/{second_id}", path(organization_id));
+
+    // Both owners step down at the same instant. Without the row lock on the organization,
+    // each request reads "there are two owners", each decides it is safe, and the organization
+    // is left with none. Repeated because the interleaving is what exposes the defect.
+    for round in 0..5 {
+        sqlx::query(
+            "INSERT INTO organization_members (organization_id, user_id, role) \
+             VALUES ($1, $2, 'owner'), ($1, $3, 'owner') \
+             ON CONFLICT (organization_id, user_id) DO UPDATE SET role = 'owner'",
+        )
+        .bind(organization_id)
+        .bind(first_id)
+        .bind(second_id)
+        .execute(&pool)
+        .await
+        .expect("both owners are restored");
+
+        let (left, right) = tokio::join!(
+            app.delete_auth(&first_path, &first),
+            app.delete_auth(&second_path, &second),
+        );
+
+        let succeeded = [left.0, right.0]
+            .iter()
+            .filter(|status| **status == StatusCode::NO_CONTENT)
+            .count();
+        assert_eq!(
+            succeeded, 1,
+            "round {round}: exactly one removal may succeed, got {:?} and {:?}",
+            left.0, right.0
+        );
+
+        let owners: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM organization_members \
+             WHERE organization_id = $1 AND role = 'owner'",
+        )
+        .bind(organization_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the owner count is readable");
+
+        assert_eq!(
+            owners, 1,
+            "round {round}: the organization must keep an owner"
+        );
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn members_are_paginated(pool: PgPool) {
     let app = TestApp::new(pool);
     let (_, owner) = account(&app, "owner@example.com").await;
