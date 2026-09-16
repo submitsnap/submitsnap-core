@@ -1,28 +1,23 @@
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar};
-use uuid::Uuid;
 
 use crate::{
     modules::{
+        ApiState,
         auth::{
-            AuthState,
             cookies::{REFRESH_TOKEN_COOKIE, access_cookie, refresh_cookie, removal_cookies},
             dto::{AuthResponse, ChangePasswordRequest, DashboardAuthResponse, RefreshRequest},
             extractor::AuthenticatedUser,
         },
         identity::{
             PublicUser,
-            dto::{
-                LoginRequest, MessageResponse, PaginationQuery, RegisterRequest,
-                UpdateUserStatusRequest, UserListResponse,
-            },
+            dto::{LoginRequest, MessageResponse, RegisterRequest},
         },
-        rbac::RoleName,
     },
     shared::{
         error::{AppError, ErrorResponse, validate},
@@ -45,13 +40,13 @@ const TOKEN_TYPE: &str = "Bearer";
     )
 )]
 pub async fn register(
-    State(state): State<AuthState>,
+    State(state): State<ApiState>,
     client: ClientInfo,
     Json(request): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<PublicUser>), AppError> {
     validate(&request)?;
     let user = state
-        .service
+        .auth
         .register(&request.email, &request.password, &client)
         .await?;
 
@@ -73,13 +68,13 @@ pub async fn register(
     )
 )]
 pub async fn login(
-    State(state): State<AuthState>,
+    State(state): State<ApiState>,
     client: ClientInfo,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
     validate(&request)?;
     let session = state
-        .service
+        .auth
         .login(&request.email, &request.password, &client)
         .await?;
 
@@ -107,14 +102,14 @@ pub async fn login(
     )
 )]
 pub async fn dashboard_login(
-    State(state): State<AuthState>,
+    State(state): State<ApiState>,
     client: ClientInfo,
     jar: CookieJar,
     Json(request): Json<LoginRequest>,
 ) -> Result<(CookieJar, Json<DashboardAuthResponse>), AppError> {
     validate(&request)?;
     let session = state
-        .service
+        .auth
         .login(&request.email, &request.password, &client)
         .await?;
 
@@ -151,7 +146,7 @@ pub async fn dashboard_login(
     )
 )]
 pub async fn refresh(
-    State(state): State<AuthState>,
+    State(state): State<ApiState>,
     client: ClientInfo,
     jar: CookieJar,
     Json(request): Json<RefreshRequest>,
@@ -171,7 +166,7 @@ pub async fn refresh(
         }
     };
 
-    let session = state.service.refresh(&token, &client).await?;
+    let session = state.auth.refresh(&token, &client).await?;
 
     if from_cookie {
         let jar = jar
@@ -217,13 +212,13 @@ pub async fn refresh(
     )
 )]
 pub async fn logout(
-    State(state): State<AuthState>,
+    State(state): State<ApiState>,
     client: ClientInfo,
     jar: CookieJar,
     user: AuthenticatedUser,
 ) -> Result<(CookieJar, Json<MessageResponse>), AppError> {
     state
-        .service
+        .auth
         .logout(user.session_id, user.user.id, &client)
         .await?;
 
@@ -243,12 +238,12 @@ pub async fn logout(
     )
 )]
 pub async fn logout_all(
-    State(state): State<AuthState>,
+    State(state): State<ApiState>,
     client: ClientInfo,
     jar: CookieJar,
     user: AuthenticatedUser,
 ) -> Result<(CookieJar, Json<MessageResponse>), AppError> {
-    state.service.logout_all(user.user.id, &client).await?;
+    state.auth.logout_all(user.user.id, &client).await?;
 
     let jar = clear_credentials(jar, state.config.cookie_secure);
 
@@ -285,7 +280,7 @@ pub async fn me(user: AuthenticatedUser) -> Json<PublicUser> {
     )
 )]
 pub async fn change_password(
-    State(state): State<AuthState>,
+    State(state): State<ApiState>,
     client: ClientInfo,
     user: AuthenticatedUser,
     Json(request): Json<ChangePasswordRequest>,
@@ -312,70 +307,6 @@ pub async fn change_password(
     Ok(Json(MessageResponse::new(
         "Password updated. Other sessions were signed out.",
     )))
-}
-
-#[utoipa::path(
-    get,
-    path = "/api/v1/admin/users",
-    tag = "admin",
-    security(("bearer_auth" = []), ("cookie_auth" = [])),
-    params(PaginationQuery),
-    responses(
-        (status = 200, description = "Page of accounts", body = UserListResponse),
-        (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Administrator role required", body = ErrorResponse),
-    )
-)]
-pub async fn list_users(
-    State(state): State<AuthState>,
-    user: AuthenticatedUser,
-    Query(pagination): Query<PaginationQuery>,
-) -> Result<Json<UserListResponse>, AppError> {
-    user.require_role(&RoleName::admin())?;
-
-    let (limit, offset) = pagination.bounds();
-    let (users, total) = state.identity.list_users(limit, offset).await?;
-
-    Ok(Json(UserListResponse { users, total }))
-}
-
-#[utoipa::path(
-    patch,
-    path = "/api/v1/admin/users/{id}/status",
-    tag = "admin",
-    security(("bearer_auth" = []), ("cookie_auth" = [])),
-    params(("id" = Uuid, Path, description = "Account identifier")),
-    request_body = UpdateUserStatusRequest,
-    responses(
-        (status = 200, description = "Account status updated", body = PublicUser),
-        (status = 400, description = "Request was not valid, including an administrator targeting themselves", body = ErrorResponse),
-        (status = 401, description = "Not authenticated", body = ErrorResponse),
-        (status = 403, description = "Administrator role required", body = ErrorResponse),
-        (status = 404, description = "No such account", body = ErrorResponse),
-    )
-)]
-pub async fn set_user_status(
-    State(state): State<AuthState>,
-    client: ClientInfo,
-    user: AuthenticatedUser,
-    Path(target_id): Path<Uuid>,
-    Json(request): Json<UpdateUserStatusRequest>,
-) -> Result<Json<PublicUser>, AppError> {
-    user.require_role(&RoleName::admin())?;
-
-    // Guards against an administrator locking themselves out of the instance.
-    if target_id == user.user.id {
-        return Err(AppError::Validation(
-            "an administrator cannot change their own account status".into(),
-        ));
-    }
-
-    let updated = state
-        .identity
-        .set_account_status(target_id, request.status.into(), &client)
-        .await?;
-
-    Ok(Json(updated))
 }
 
 fn clear_credentials(jar: CookieJar, cookie_secure: bool) -> CookieJar {

@@ -2,7 +2,7 @@ use axum::{Json, extract::State, http::StatusCode};
 
 use crate::{
     modules::identity::{
-        IdentityState,
+        ApiState,
         dto::{
             ForgotPasswordRequest, MessageResponse, ResendVerificationRequest,
             ResetPasswordRequest, VerifyEmailRequest,
@@ -26,12 +26,12 @@ use crate::{
     )
 )]
 pub async fn verify_email(
-    State(state): State<IdentityState>,
+    State(state): State<ApiState>,
     client: ClientInfo,
     Json(request): Json<VerifyEmailRequest>,
 ) -> Result<Json<MessageResponse>, AppError> {
     validate(&request)?;
-    state.service.verify_email(&request.token, &client).await?;
+    state.identity.verify_email(&request.token, &client).await?;
     Ok(Json(MessageResponse::new("Email address confirmed.")))
 }
 
@@ -47,13 +47,13 @@ pub async fn verify_email(
     )
 )]
 pub async fn resend_verification(
-    State(state): State<IdentityState>,
+    State(state): State<ApiState>,
     client: ClientInfo,
     Json(request): Json<ResendVerificationRequest>,
 ) -> Result<(StatusCode, Json<MessageResponse>), AppError> {
     validate(&request)?;
     state
-        .service
+        .identity
         .resend_verification(&request.email, &client)
         .await?;
     Ok((
@@ -76,14 +76,14 @@ pub async fn resend_verification(
     )
 )]
 pub async fn forgot_password(
-    State(state): State<IdentityState>,
+    State(state): State<ApiState>,
     client: ClientInfo,
     Json(request): Json<ForgotPasswordRequest>,
 ) -> Result<(StatusCode, Json<MessageResponse>), AppError> {
     validate(&request)?;
     // The reset link is delivered by email, so the raw token is deliberately dropped here.
     let _ = state
-        .service
+        .identity
         .request_password_reset(&request.email, &client)
         .await?;
     Ok((
@@ -106,13 +106,13 @@ pub async fn forgot_password(
     )
 )]
 pub async fn reset_password(
-    State(state): State<IdentityState>,
+    State(state): State<ApiState>,
     client: ClientInfo,
     Json(request): Json<ResetPasswordRequest>,
 ) -> Result<Json<MessageResponse>, AppError> {
     validate(&request)?;
     state
-        .service
+        .identity
         .reset_password(&request.token, &request.password, &client)
         .await?;
 

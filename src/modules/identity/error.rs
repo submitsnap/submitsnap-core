@@ -20,6 +20,14 @@ pub enum IdentityError {
     InvalidToken,
     #[error("account not found")]
     NotFound,
+    #[error("this change would leave the instance without an active administrator")]
+    LastAdministrator,
+    #[error("an administrator cannot apply this change to their own account")]
+    SelfTargeted,
+    #[error("unknown role: {0}")]
+    UnknownRole(String),
+    #[error("the confirmation address does not match the account")]
+    ConfirmationMismatch,
     #[error("internal identity error")]
     Internal(#[from] anyhow::Error),
 }
@@ -40,6 +48,10 @@ impl From<IdentityError> for AppError {
             IdentityError::EmailNotVerified => Self::Forbidden,
             IdentityError::InvalidToken => Self::InvalidToken,
             IdentityError::NotFound => Self::NotFound,
+            IdentityError::LastAdministrator => Self::Validation(error.to_string()),
+            IdentityError::SelfTargeted => Self::Validation(error.to_string()),
+            IdentityError::UnknownRole(role) => Self::Validation(format!("unknown role: {role}")),
+            IdentityError::ConfirmationMismatch => Self::Validation(error.to_string()),
             IdentityError::Internal(error) => Self::Internal(error),
         }
     }

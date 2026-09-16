@@ -26,7 +26,7 @@ endif
 .DEFAULT_GOAL := help
 
 .PHONY: help up down logs check-sqlx db-create migrate db-reset bootstrap \
-        run worker check-email build fmt lint test-unit test ci clean
+        run worker check-email grant-admin build fmt lint test-unit test ci clean
 
 help: ## List the available targets
 	@printf 'SubmitSnap Core\n\nUsage: make <target>\n\nTargets:\n'
@@ -80,6 +80,12 @@ check-email: ## Send one test message through the configured SMTP server (TO=you
 		printf '\033[31mSet TO=<recipient>:\033[0m make check-email TO=you@example.com\n'; \
 		exit 1; }
 	$(CARGO) run --bin check_email -- '$(TO)'
+
+grant-admin: ## Grant the administrator role to an existing account (EMAIL=you@example.com)
+	@test -n '$(EMAIL)' || { \
+		printf '\033[31mSet EMAIL=<account>:\033[0m make grant-admin EMAIL=you@example.com\n'; \
+		exit 1; }
+	$(CARGO) run --bin grant_admin -- '$(EMAIL)'
 
 build: ## Build the release binaries
 	$(CARGO) build --release

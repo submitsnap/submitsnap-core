@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
-use crate::modules::rbac::RoleName;
+use crate::modules::rbac::{RoleName, model::ADMIN_ROLE};
 
 #[derive(Clone)]
 pub struct RoleRepository {
@@ -48,6 +48,57 @@ impl RoleRepository {
         .await?;
 
         Ok(())
+    }
+
+    /// Every role this deployment defines, for validating operator input before it is applied.
+    pub async fn role_names(&self) -> anyhow::Result<Vec<RoleName>> {
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM roles ORDER BY name")
+            .fetch_all(&self.database)
+            .await?;
+
+        Ok(names.into_iter().map(RoleName::new).collect())
+    }
+
+    /// Replaces an account's role set with exactly `roles`.
+    ///
+    /// A single statement, so it is atomic without a caller-managed transaction. The delete
+    /// and the insert touch disjoint rows, which is why they can share one statement safely.
+    pub async fn replace_for_user(&self, user_id: Uuid, roles: &[RoleName]) -> anyhow::Result<()> {
+        let names: Vec<&str> = roles.iter().map(RoleName::as_str).collect();
+
+        sqlx::query(
+            "WITH desired AS (SELECT id FROM roles WHERE name = ANY($2)), \
+                  removed AS ( \
+                      DELETE FROM user_roles \
+                      WHERE user_id = $1 AND role_id NOT IN (SELECT id FROM desired) \
+                  ) \
+             INSERT INTO user_roles (user_id, role_id) \
+             SELECT $1, id FROM desired \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(&names)
+        .execute(&self.database)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Accounts that both hold the administrator role and can still sign in. Any change that
+    /// would empty this list is refused, so an instance cannot be left unadministrable.
+    pub async fn active_admin_ids(&self) -> anyhow::Result<Vec<Uuid>> {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT users.id FROM users \
+             JOIN user_roles ON user_roles.user_id = users.id \
+             JOIN roles ON roles.id = user_roles.role_id \
+             WHERE roles.name = $1 AND users.status = 'active'::user_status \
+             ORDER BY users.id",
+        )
+        .bind(ADMIN_ROLE)
+        .fetch_all(&self.database)
+        .await?;
+
+        Ok(ids)
     }
 
     pub async fn roles_for_user(&self, user_id: Uuid) -> anyhow::Result<Vec<RoleName>> {

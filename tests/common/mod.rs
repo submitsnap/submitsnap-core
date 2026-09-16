@@ -134,6 +134,35 @@ impl TestApp {
         .await
     }
 
+    pub async fn put_json_auth(&self, path: &str, body: Value, token: &str) -> (StatusCode, Value) {
+        read(
+            self.send(json_request(Method::PUT, path, Some(body), Some(token)))
+                .await,
+        )
+        .await
+    }
+
+    pub async fn delete_json_auth(
+        &self,
+        path: &str,
+        body: Value,
+        token: &str,
+    ) -> (StatusCode, Value) {
+        read(
+            self.send(json_request(Method::DELETE, path, Some(body), Some(token)))
+                .await,
+        )
+        .await
+    }
+
+    pub async fn delete_auth(&self, path: &str, token: &str) -> (StatusCode, Value) {
+        read(
+            self.send(json_request(Method::DELETE, path, None, Some(token)))
+                .await,
+        )
+        .await
+    }
+
     pub async fn get_auth(&self, path: &str, token: &str) -> (StatusCode, Value) {
         read(
             self.send(json_request(Method::GET, path, None, Some(token)))

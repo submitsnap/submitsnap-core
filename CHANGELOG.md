@@ -29,9 +29,26 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 - `LOG_FORMAT` selecting human-readable coloured logs (the default) or JSON for a log collector, with request-level tracing enabled for the readable format.
 - Startup banner showing the bound address, the database and email queue status, the Swagger UI and OpenAPI URLs, and a summary of the active settings, with credentials redacted from connection strings.
 - Email queue reachability is checked at startup and reported, instead of surfacing at the first sign-up.
+- `GET /admin/users/{id}` returning one account with its failed-attempt count, lock, and last sign-in.
+- `PUT /admin/users/{id}/roles` replacing an account's role set, auditing each grant and revocation.
+- `POST /admin/users/{id}/unlock` clearing a lockout, and `DELETE /admin/users/{id}/sessions` signing an account out without changing its status.
+- `DELETE /admin/users/{id}` removing an account, requiring the caller to repeat its address.
+- `GET /admin/audit-events`, a paginated and filterable view of the audit trail that was previously written but unreadable.
+- Filters on `GET /admin/users` for email search, status, and role.
+- `grant_admin` binary and `make grant-admin` for creating the first administrator, which the API alone cannot do.
+- Audit event types for role changes, unlocks, session revocations, and deletions.
+- Organizations, with membership and the `owner` / `admin` / `member` roles. An account may belong to many, and is provisioned none automatically.
+- `POST /organizations`, `GET /organizations`, `GET`/`PATCH`/`DELETE /organizations/{id}`, member listing, invitation by email, role changes, and removal.
+- Read-only `GET /admin/organizations` and `/admin/organizations/{id}` for instance administrators.
+- `access(...)` resolution returning the caller's organization role, with `require_manager` and `require_owner` guards, so authorization cannot be skipped by accident.
+- `auth_events.actor_user_id` and `auth_events.organization_id`, so an administrative action records who did it and to which tenant.
+- Audit event types for organization creation, renaming, deletion, and membership changes, plus the `organization_id` filter on the audit trail.
 
 ### Changed
 
+- The shared HTTP state moved from `auth` to `modules/mod.rs` as `ApiState`, so a new route module does not have to depend on `auth` to reach the `AuthenticatedUser` extractor.
+- Guard invariants are now documented where they are enforced: an organization keeps one owner, and a role only reaches as far as itself.
+- Pagination limits moved to `shared::pagination`, used by every listing endpoint.
 - Split the single authentication module into `auth`, `identity`, `session`, and `rbac` slices with one-way dependencies.
 - Upgraded Axum from 0.7 to 0.8 so the cookie and OpenAPI integrations share one HTTP stack.
 - `POST /auth/register` now only creates the account; clients sign in through `POST /auth/login`.

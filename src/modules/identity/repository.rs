@@ -2,10 +2,90 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::modules::identity::{
-    error::IdentityError,
-    model::{USER_COLUMNS, UserRecord, UserStatus},
+use crate::modules::{
+    identity::{
+        error::IdentityError,
+        model::{USER_COLUMNS, UserRecord, UserStatus},
+    },
+    rbac::RoleName,
 };
+
+/// Narrowing applied when listing accounts. `None` means "do not filter on this".
+#[derive(Debug, Clone, Default)]
+pub struct UserFilters {
+    /// A `LIKE` pattern, already escaped and wrapped in wildcards by [`UserFilters::from_query`].
+    pub search: Option<String>,
+    pub status: Option<UserStatus>,
+    pub role: Option<RoleName>,
+}
+
+impl UserFilters {
+    /// Builds filters from raw operator input, escaping the search term so a stray `%` is
+    /// matched literally instead of widening the query.
+    pub fn from_query(
+        search: Option<&str>,
+        status: Option<UserStatus>,
+        role: Option<RoleName>,
+    ) -> Self {
+        Self {
+            search: search
+                .map(str::trim)
+                .filter(|term| !term.is_empty())
+                .map(like_contains),
+            status,
+            role,
+        }
+    }
+}
+
+/// Escapes the `LIKE` metacharacters in a term so it matches literally, then wraps it in
+/// wildcards for a substring search.
+fn like_contains(term: &str) -> String {
+    let escaped = term
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+
+    format!("%{escaped}%")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_terms_are_escaped_and_wrapped() {
+        assert_eq!(like_contains("ann"), "%ann%");
+        assert_eq!(like_contains("100%"), "%100\\%%");
+        assert_eq!(like_contains("a_b"), "%a\\_b%");
+        assert_eq!(like_contains("back\\slash"), "%back\\\\slash%");
+    }
+
+    #[test]
+    fn blank_search_terms_are_dropped() {
+        assert!(
+            UserFilters::from_query(Some("   "), None, None)
+                .search
+                .is_none()
+        );
+        assert!(UserFilters::from_query(None, None, None).search.is_none());
+        assert_eq!(
+            UserFilters::from_query(Some(" ann "), None, None)
+                .search
+                .as_deref(),
+            Some("%ann%")
+        );
+    }
+}
+
+/// Shared `WHERE` for the account listing queries. Every branch is `NULL`-tolerant, so one
+/// parameterized statement serves filtered and unfiltered reads alike.
+const USER_FILTERS: &str = "WHERE ($1::text IS NULL OR lower(email) LIKE $1) \
+     AND ($2::user_status IS NULL OR status = $2) \
+     AND ($3::text IS NULL OR EXISTS ( \
+         SELECT 1 FROM user_roles \
+         JOIN roles ON roles.id = user_roles.role_id \
+         WHERE user_roles.user_id = users.id AND roles.name = $3))";
 
 #[derive(Clone)]
 pub struct UserRepository {
@@ -66,10 +146,21 @@ impl UserRepository {
             .map_err(internal)
     }
 
-    pub async fn list(&self, limit: i64, offset: i64) -> Result<Vec<UserRecord>, IdentityError> {
+    /// Lists accounts newest first, with optional narrowing. Backed by the `created_at DESC`
+    /// index; `search` is a substring match, so it scans within the page rather than seeking.
+    pub async fn list(
+        &self,
+        filters: &UserFilters,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<UserRecord>, IdentityError> {
         sqlx::query_as::<_, UserRecord>(&format!(
-            "SELECT {USER_COLUMNS} FROM users ORDER BY created_at DESC, id LIMIT $1 OFFSET $2"
+            "SELECT {USER_COLUMNS} FROM users {USER_FILTERS} \
+             ORDER BY created_at DESC, id LIMIT $4 OFFSET $5"
         ))
+        .bind(filters.search.as_deref())
+        .bind(filters.status)
+        .bind(filters.role.as_ref().map(RoleName::as_str))
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.database)
@@ -77,11 +168,26 @@ impl UserRepository {
         .map_err(internal)
     }
 
-    pub async fn count(&self) -> Result<i64, IdentityError> {
-        sqlx::query_scalar("SELECT count(*) FROM users")
+    pub async fn count(&self, filters: &UserFilters) -> Result<i64, IdentityError> {
+        sqlx::query_scalar(&format!("SELECT count(*) FROM users {USER_FILTERS}"))
+            .bind(filters.search.as_deref())
+            .bind(filters.status)
+            .bind(filters.role.as_ref().map(RoleName::as_str))
             .fetch_one(&self.database)
             .await
             .map_err(internal)
+    }
+
+    /// Removes an account. Sessions, refresh tokens, and role grants cascade away; audit rows
+    /// survive with their account reference cleared, which is what an audit trail should do.
+    pub async fn delete(&self, id: Uuid) -> Result<bool, IdentityError> {
+        let outcome = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(id)
+            .execute(&self.database)
+            .await
+            .map_err(internal)?;
+
+        Ok(outcome.rows_affected() > 0)
     }
 
     /// Clears the failure window after a successful authentication.

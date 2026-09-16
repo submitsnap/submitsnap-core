@@ -2,8 +2,6 @@ pub mod modules;
 pub mod openapi;
 pub mod shared;
 
-use std::sync::Arc;
-
 use axum::{Router, routing::get};
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi as _;
@@ -11,8 +9,10 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
     modules::{
-        auth::{AuthState, admin_router, router as auth_router},
-        identity::{IdentityService, IdentityState, router as identity_router},
+        ApiState,
+        auth::{admin_router as auth_admin_router, router as auth_router},
+        identity::router as identity_router,
+        organization::{admin_router as organization_admin_router, router as organization_router},
     },
     shared::{health, ratelimit, security, state::AppState},
 };
@@ -22,28 +22,23 @@ use crate::{
 /// Fails when the process configuration or the CORS allowlist cannot be turned into a valid
 /// service, so a misconfigured deployment stops at startup instead of at the first request.
 pub fn app(state: AppState) -> anyhow::Result<Router> {
-    let identity = Arc::new(IdentityService::new(
+    let api_state = ApiState::new(
         state.database.clone(),
         state.queue.clone(),
         state.config.clone(),
-    )?);
-
-    let auth_state = AuthState::new(
-        identity.clone(),
-        state.database.clone(),
-        state.config.clone(),
         state.rate_limiters.clone(),
-    );
+    )?;
 
-    let identity_state = IdentityState {
-        service: identity,
-        limiters: state.rate_limiters.clone(),
-    };
+    // Every administrative route lives behind one prefix, whether it manages accounts or
+    // organizations, so the surface is easy to reason about and to lock down.
+    let administration =
+        auth_admin_router(api_state.clone()).merge(organization_admin_router(api_state.clone()));
 
     let api = Router::new()
-        .nest("/auth", auth_router(auth_state.clone()))
-        .nest("/identity", identity_router(identity_state))
-        .nest("/admin", admin_router(auth_state));
+        .nest("/auth", auth_router(api_state.clone()))
+        .nest("/identity", identity_router(api_state.clone()))
+        .nest("/organizations", organization_router(api_state))
+        .nest("/admin", administration);
 
     // Everything under the API can return or establish a credential.
     let api = security::no_store(api);

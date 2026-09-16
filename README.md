@@ -19,8 +19,9 @@ SubmitSnap Cloud will be an optional managed offering built around this project.
 - Rotating, revocable refresh tokens with reuse detection
 - Email verification, password reset, and password change flows
 - Per-account login lockout plus per-IP request limiting
-- Role-based authorization with `user` and `admin` roles
-- Append-only audit trail of authentication events
+- Role-based authorization with instance-wide `user` and `admin` roles
+- Organizations with `owner`, `admin`, and `member` roles, so resources can be managed per tenant
+- Append-only audit trail of authentication and authorization events, naming the actor, the subject, and the organization
 - Bearer-token login for API clients and HttpOnly cookie login for the dashboard
 - OpenAPI document and Swagger UI generated from the handlers
 - Local SMTP delivery with STARTTLS, implicit TLS, or explicit plaintext
@@ -87,8 +88,74 @@ All current API routes are prefixed with `/api/v1`.
 | `POST /identity/email/verification` | public | Re-send the confirmation link. Reveals nothing about whether an account exists. |
 | `POST /identity/password/forgot` | public | Start a password reset. Always reports acceptance. |
 | `POST /identity/password/reset` | token | Complete a reset. The token is single use and every session is revoked. |
-| `GET /admin/users` | session + `admin` | Paginated account listing, demonstrating role-based authorization. |
-| `PATCH /admin/users/{id}/status` | session + `admin` | Disable or re-enable an account. Disabling signs it out everywhere. |
+| `GET /admin/users` | session + `admin` | Paginated accounts. Filter by `search`, `status`, and `role`. |
+| `GET /admin/users/{id}` | session + `admin` | One account, including failed attempts, lock, and last sign-in. |
+| `PATCH /admin/users/{id}/status` | session + `admin` | Enable or disable an account. Disabling signs it out everywhere. |
+| `PUT /admin/users/{id}/roles` | session + `admin` | Replace the account's roles with exactly the supplied set. |
+| `POST /admin/users/{id}/unlock` | session + `admin` | Clear failed attempts and lift a lockout. |
+| `DELETE /admin/users/{id}/sessions` | session + `admin` | Sign the account out everywhere without changing its status. |
+| `DELETE /admin/users/{id}` | session + `admin` | Permanently remove the account. The body must repeat the address. |
+| `GET /admin/audit-events` | session + `admin` | Audit trail, newest first. Filter by `user_id`, `organization_id`, `email`, `event_type`, `since`, `until`. |
+| `GET /admin/organizations` | session + `admin` | Read-only listing of every organization. |
+| `GET /admin/organizations/{id}` | session + `admin` | Read-only organization detail. |
+
+### Organizations
+
+An organization is the tenant everything else will belong to. An account may belong to as many as it likes, and may belong to none — nothing is provisioned automatically, so an organization is always something somebody deliberately created.
+
+| Method + path | Required | Notes |
+| --- | --- | --- |
+| `POST /organizations` | any account | Creates it and makes the caller the owner. Any account may do this, which is why no bootstrap step is needed. |
+| `GET /organizations` | any account | Only the caller's, each with their role. |
+| `GET /organizations/{id}` | member | |
+| `PATCH /organizations/{id}` | owner, admin | Rename. |
+| `DELETE /organizations/{id}` | owner | Memberships cascade away with it. |
+| `GET /organizations/{id}/members` | member | Paginated. |
+| `POST /organizations/{id}/members` | owner, admin | By email, because that is what an operator knows about a person. 201 when added, 200 when an existing member's role changed. |
+| `PUT /organizations/{id}/members/{user_id}` | owner, admin | Set a member's role. |
+| `DELETE /organizations/{id}/members/{user_id}` | owner, admin; anyone may remove themselves | Leaving is always allowed. |
+
+Two rules keep an organization from becoming unmanageable, and both are enforced in the service rather than left to an operator's care:
+
+- **An organization always keeps at least one owner.** Removing or demoting the last one is refused, which is also what makes leaving safe to allow.
+- **A role only reaches as far as itself.** An owner reaches everyone; an admin reaches peers and members, so only an owner can create another owner, and nothing but an owner can touch one.
+
+Instance administrators may **read** organizations but never change their membership. That is not a separate rule so much as a consequence of the design: the mutating routes require membership, and the instance role does not grant it. Read-only routes accept the instance role in addition.
+
+### Two role systems, on purpose
+
+| Concept | Stored as | Answers |
+| --- | --- | --- |
+| Instance role (`user`, `admin`) | the `roles` / `user_roles` tables | Who administers this deployment? |
+| Organization role (`owner`, `admin`, `member`) | `organization_members.role` | Who manages this tenant's resources? |
+
+Instance roles are a table because an operator defines them. Organization roles are a fixed hierarchy the code branches on, so they are an enum on both sides — a `match` over one is exhaustive, and an unknown value cannot reach the code at all.
+
+### The scoping rule for tables that come next
+
+Forms, submissions, and everything after them will be owned by an organization. They must follow this shape:
+
+- Carry `organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE`. Never nullable, so a query cannot silently span tenants by forgetting a filter.
+- Lead its indexes with `organization_id`, because every read is scoped.
+- Take the organization id as an explicit argument in repository methods rather than reading it from an ambient context, so a missing scope is a compile error rather than a leak.
+- Resolve authorization with one `access(...)` call per handler, so the check cannot be forgotten.
+
+### Administering an instance
+
+Two rules keep an instance from becoming unadministrable, and both are enforced in the service rather than left to an operator's care:
+
+- **Status changes and deletions cannot target the caller.** The caller is provably an active administrator, so at least one such account always survives them.
+- **Role changes may target the caller**, so an administrator can step down, but only while somebody else still holds the role.
+
+Nothing else can hand out the `admin` role, so a fresh instance needs one bootstrap step:
+
+```bash
+make grant-admin EMAIL=you@example.com
+```
+
+The command talks to the database directly and only ever adds the role. It is also the way back in if the last administrator is ever lost. A role change takes effect on the account's next request, whatever sessions it already holds, because authorization is read from the database rather than baked into the token.
+
+Deleting an account cascades to its sessions, refresh tokens, and role grants. Its audit entries are kept, with the account reference cleared and the email address retained, so the history stays useful.
 
 ## Security notes
 
@@ -99,7 +166,7 @@ All current API routes are prefixed with `/api/v1`.
 - **Cookies** are `HttpOnly`, `SameSite=Lax`, and scoped to `/api/v1`. All state-changing routes are `POST` and require a JSON body, which is the CSRF boundary. For any HTTPS deployment set `COOKIE_SECURE=true`, which also enables HSTS.
 - **CORS** is disabled unless `CORS_ALLOWED_ORIGINS` lists explicit origins. Credentialed requests are never allowed from a wildcard origin.
 - **Rate limiting does not trust forwarded-IP headers**, because they are spoofable. Serve the API with real client socket addresses; enforce additional limits at a proxy if you run one.
-- **Audit events** are appended to `auth_events` and never block the operation they describe. `auth_events.email` records the address attempted during failed sign-ins, which is personal data: define a retention policy and prune old rows, for example `DELETE FROM auth_events WHERE created_at < NOW() - INTERVAL '90 days'`.
+- **Audit events** are appended to `auth_events` and never block the operation they describe. Each row names the account the event concerns, the authenticated account that caused it, and the organization when one is involved — so an administrative action is attributable, not just visible. `auth_events.email` records the address attempted during failed sign-ins, which is personal data: define a retention policy and prune old rows, for example `DELETE FROM auth_events WHERE created_at < NOW() - INTERVAL '90 days'`. Deleting an account or an organization clears those references from its older rows, which is deliberate: the trail outlives its subjects.
 
 ## Email delivery
 
@@ -172,13 +239,15 @@ Modules are vertical slices with the same internal shape (handler, service, repo
 
 ```text
 src/modules/
-  auth/       login, sessions, access tokens, the authenticated-user extractor
-  identity/   accounts, credentials, email verification, password recovery, audit events
-  session/    refresh token families, rotation, and revocation
-  rbac/       roles and grants
+  api state   modules/mod.rs — the state every router shares
+  auth/          login, sessions, access tokens, the authenticated-user extractor, account administration
+  identity/      accounts, credentials, email verification, password recovery, audit events
+  session/       refresh token families, rotation, and revocation
+  rbac/          instance roles and grants
+  organization/  tenants, membership, and the access checks over them
 ```
 
-Dependencies flow one way: `auth` depends on `identity` and `session`; `identity` depends on `session` and `rbac`. Nothing depends on `auth`.
+Dependencies flow one way: `auth` depends on `identity` and `session`; `identity` depends on `session` and `rbac`; `organization` depends on `identity`. The shared `ApiState` lives at the module root, so a new route module never has to borrow another module's state to reach the `AuthenticatedUser` extractor.
 
 When form ingestion is introduced, PostgreSQL will remain the durable source of truth:
 
@@ -194,7 +263,8 @@ A submission must be stored transactionally before any asynchronous work is acce
 
 ## Roadmap
 
-- [ ] Workspace, project, form, and submission data model
+- [x] Organizations with `owner`, `admin`, and `member` roles
+- [ ] Project, form, and submission model, each scoped to an organization
 - [ ] Public `POST /f/:public_form_id` ingestion endpoint
 - [ ] Transactional outbox and reliable webhook/email delivery
 - [ ] Submission inbox API and data export

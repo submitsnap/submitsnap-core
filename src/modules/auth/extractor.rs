@@ -6,11 +6,7 @@ use axum_extra::extract::cookie::CookieJar;
 use uuid::Uuid;
 
 use crate::{
-    modules::{
-        auth::{AuthState, cookies::ACCESS_TOKEN_COOKIE},
-        identity::PublicUser,
-        rbac::RoleName,
-    },
+    modules::{ApiState, auth::cookies::ACCESS_TOKEN_COOKIE, identity::PublicUser, rbac::RoleName},
     shared::error::AppError,
 };
 
@@ -39,12 +35,12 @@ impl AuthenticatedUser {
     }
 }
 
-impl FromRequestParts<AuthState> for AuthenticatedUser {
+impl FromRequestParts<ApiState> for AuthenticatedUser {
     type Rejection = AppError;
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &AuthState,
+        state: &ApiState,
     ) -> Result<Self, Self::Rejection> {
         let token = match bearer_token(parts) {
             Some(token) => token.to_owned(),
@@ -60,7 +56,7 @@ impl FromRequestParts<AuthState> for AuthenticatedUser {
             }
         };
 
-        Ok(state.service.authenticate(&token).await?)
+        Ok(state.auth.authenticate(&token).await?)
     }
 }
 

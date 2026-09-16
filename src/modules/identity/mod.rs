@@ -1,10 +1,11 @@
+mod administration;
 pub(crate) mod dto;
 mod error;
-mod events;
+pub(crate) mod events;
 pub(crate) mod handler;
 mod model;
 mod password;
-mod repository;
+pub(crate) mod repository;
 mod service;
 mod tokens;
 
@@ -14,23 +15,14 @@ pub use events::AuthEventType;
 pub use model::UserStatus;
 pub use service::IdentityService;
 
-use std::sync::Arc;
-
 use axum::{Router, routing::post};
 
-use crate::shared::ratelimit::{RateLimiters, limit};
-
-/// Shared state for the account-lifecycle routes.
-#[derive(Clone)]
-pub struct IdentityState {
-    pub service: Arc<IdentityService>,
-    pub limiters: RateLimiters,
-}
+use crate::{modules::ApiState, shared::ratelimit::limit};
 
 /// Routes mounted under `/api/v1/identity`. Every route here is unauthenticated by design:
 /// they are exercised before a caller has a session, and each one either consumes a
 /// single-use token or deliberately reveals nothing.
-pub fn router<S>(state: IdentityState) -> Router<S>
+pub fn router<S>(state: ApiState) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {

@@ -68,7 +68,14 @@ fn cors_layer(origins: &[String]) -> anyhow::Result<CorsLayer> {
     Ok(CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
         .allow_credentials(true)
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
         .max_age(Duration::from_secs(600)))
 }

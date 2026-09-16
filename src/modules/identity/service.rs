@@ -40,13 +40,15 @@ const EMAIL_ENQUEUE_ATTEMPTS: u32 = 3;
 /// First retry delay; each subsequent retry doubles it.
 const EMAIL_ENQUEUE_BASE_DELAY_MS: u64 = 50;
 
+/// Shared collaborators for the account lifecycle and for administration, which lives in the
+/// sibling `administration` module and therefore needs `pub(super)` access.
 #[derive(Clone)]
 pub struct IdentityService {
-    users: UserRepository,
-    tokens: OneTimeTokenRepository,
-    roles: RoleRepository,
-    sessions: SessionRepository,
-    events: AuthEventRepository,
+    pub(super) users: UserRepository,
+    pub(super) tokens: OneTimeTokenRepository,
+    pub(super) roles: RoleRepository,
+    pub(super) sessions: SessionRepository,
+    pub(super) events: AuthEventRepository,
     passwords: PasswordHasher,
     queue: EmailQueue,
     config: Arc<AppConfig>,
@@ -406,67 +408,6 @@ impl IdentityService {
         Ok(PublicUser::new(user, roles))
     }
 
-    /// Paginated account listing for administrators. Roles for the whole page are fetched in
-    /// one query rather than per row.
-    pub async fn list_users(
-        &self,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<PublicUser>, i64), IdentityError> {
-        let users = self.users.list(limit, offset).await?;
-        let total = self.users.count().await?;
-
-        let ids: Vec<Uuid> = users.iter().map(|user| user.id).collect();
-        let mut roles = self
-            .roles
-            .roles_for_users(&ids)
-            .await
-            .map_err(IdentityError::Internal)?;
-
-        let public = users
-            .iter()
-            .map(|user| PublicUser::new(user, roles.remove(&user.id).unwrap_or_default()))
-            .collect();
-
-        Ok((public, total))
-    }
-
-    /// Changes an account's status. Disabling also signs the account out everywhere, because
-    /// this is normally a response to abuse rather than a routine edit.
-    pub async fn set_account_status(
-        &self,
-        target_id: Uuid,
-        status: UserStatus,
-        client: &ClientInfo,
-    ) -> Result<PublicUser, IdentityError> {
-        if !self.users.set_status(target_id, status).await? {
-            return Err(IdentityError::NotFound);
-        }
-
-        if status == UserStatus::Disabled {
-            self.sessions
-                .revoke_all_for_user(target_id)
-                .await
-                .map_err(IdentityError::Internal)?;
-        }
-
-        let user = self
-            .users
-            .find_by_id(target_id)
-            .await?
-            .ok_or(IdentityError::NotFound)?;
-
-        self.record(
-            AuthEventType::AccountStatusChanged,
-            Some(target_id),
-            Some(&user.email),
-            client,
-        )
-        .await;
-
-        self.public_user(&user).await
-    }
-
     /// Issues (and emails) a fresh verification link, invalidating any outstanding one.
     /// The raw token is returned to the caller for dispatch and must not be exposed.
     async fn issue_email_verification(
@@ -586,7 +527,9 @@ impl IdentityService {
         }
     }
 
-    async fn record(
+    /// Appends an audit record for something an account did to itself, where the actor and the
+    /// subject are the same account.
+    pub(super) async fn record(
         &self,
         event_type: AuthEventType,
         user_id: Option<Uuid>,
@@ -596,12 +539,47 @@ impl IdentityService {
         self.events
             .record(AuthEvent {
                 user_id,
+                actor_user_id: user_id,
+                organization_id: None,
                 email,
                 event_type,
                 ip_address: client.ip_address,
                 user_agent: client.user_agent.as_deref(),
             })
             .await;
+    }
+
+    /// Appends an audit record for an action one account takes against another. The actor is
+    /// stored separately, because knowing who did it is the point of the trail.
+    pub(super) async fn record_action(
+        &self,
+        event_type: AuthEventType,
+        actor_id: Uuid,
+        subject_id: Option<Uuid>,
+        email: Option<&str>,
+        client: &ClientInfo,
+    ) {
+        self.events
+            .record(AuthEvent {
+                user_id: subject_id,
+                actor_user_id: Some(actor_id),
+                organization_id: None,
+                email,
+                event_type,
+                ip_address: client.ip_address,
+                user_agent: client.user_agent.as_deref(),
+            })
+            .await;
+    }
+
+    /// Resolves an address to an account, for features that reference accounts by address —
+    /// inviting somebody to an organization, for instance.
+    pub async fn user_id_by_email(&self, email: &str) -> Result<Option<Uuid>, IdentityError> {
+        Ok(self
+            .users
+            .find_by_email(&normalize_email(email))
+            .await?
+            .map(|user| user.id))
     }
 
     fn lock_expiry(&self) -> DateTime<Utc> {
