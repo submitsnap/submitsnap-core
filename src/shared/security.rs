@@ -13,9 +13,13 @@ use tower_http::{
 
 use crate::shared::config::AppConfig;
 
-/// Applies the transport-level protections every deployment should have: a bounded request
-/// body, a request deadline, security headers, and an optional CORS allowlist.
-pub fn harden<S>(router: Router<S>, config: &AppConfig) -> anyhow::Result<Router<S>>
+/// Transport-level protections every deployment should have: security headers, a bounded
+/// request body, and a request deadline.
+///
+/// CORS is deliberately *not* applied here. There are two different policies — the API's
+/// allowlist and the wide-open one the public form endpoints need — and a single layer over the
+/// whole router would let the outer one overwrite the inner one's headers.
+pub fn transport<S>(router: Router<S>, config: &AppConfig) -> anyhow::Result<Router<S>>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -36,11 +40,37 @@ where
         ));
     }
 
-    if let Some(origins) = config.cors_origins() {
-        router = router.layer(cors_layer(&origins)?);
-    }
-
     Ok(router)
+}
+
+/// Applies the deployment's origin allowlist. Meant for the API subtree only, and disabled
+/// entirely when no origins are configured.
+pub fn api_cors<S>(router: Router<S>, config: &AppConfig) -> anyhow::Result<Router<S>>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    match config.cors_origins() {
+        Some(origins) => Ok(router.layer(allowlisted(&origins)?)),
+        None => Ok(router),
+    }
+}
+
+/// Opens the public form endpoints to every origin.
+///
+/// A form is embedded on somebody else's site by design, so its submission arrives cross-origin
+/// and the browser refuses it unless the response welcomes that origin. Credentials are not
+/// allowed here: these endpoints read no cookie and establish nothing, and asking for
+/// credentials together with a wildcard origin is the combination browsers reject outright.
+pub fn public_cors<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.layer(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::any())
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers([header::CONTENT_TYPE]),
+    )
 }
 
 /// Marks a response as non-cacheable. Required for every response that carries or
@@ -56,7 +86,7 @@ fn header_layer(name: HeaderName, value: &'static str) -> SetResponseHeaderLayer
     SetResponseHeaderLayer::overriding(name, HeaderValue::from_static(value))
 }
 
-fn cors_layer(origins: &[String]) -> anyhow::Result<CorsLayer> {
+fn allowlisted(origins: &[String]) -> anyhow::Result<CorsLayer> {
     let origins = origins
         .iter()
         .map(|origin| {

@@ -12,10 +12,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DashMapStateStore};
+use uuid::Uuid;
 
 use crate::shared::{config::AppConfig, error::AppError};
 
 pub type KeyedLimiter = RateLimiter<IpAddr, DashMapStateStore<IpAddr>, DefaultClock>;
+
+/// Keyed by form rather than by caller, because a busy form is a legitimate thing and a flood
+/// aimed at one tenant should not consume anybody else's budget.
+pub type FormLimiter = RateLimiter<Uuid, DashMapStateStore<Uuid>, DefaultClock>;
 
 /// Per-client-IP request budgets. Authentication endpoints get tighter budgets than the
 /// global default because they are the primary target for credential stuffing.
@@ -27,6 +32,10 @@ pub struct RateLimiters {
     /// Shared budget for sensitive unauthenticated endpoints: password reset and email
     /// verification.
     pub sensitive: Arc<KeyedLimiter>,
+    /// Per-caller-IP budget for public form submissions.
+    pub submissions: Arc<KeyedLimiter>,
+    /// Per-form budget for public form submissions.
+    pub submissions_per_form: Arc<FormLimiter>,
 }
 
 impl RateLimiters {
@@ -36,6 +45,10 @@ impl RateLimiters {
             login: per_minute(config.login_rate_limit_per_minute),
             register: per_hour(config.register_rate_limit_per_hour),
             sensitive: per_hour(config.sensitive_rate_limit_per_hour),
+            submissions: per_minute(config.submission_rate_limit_per_minute),
+            submissions_per_form: Arc::new(RateLimiter::keyed(Quota::per_minute(non_zero(
+                config.submission_per_form_rate_limit_per_minute,
+            )))),
         }
     }
 }

@@ -293,6 +293,7 @@ impl IdentityService {
                 user_id: Some(user.id),
                 actor_user_id: None,
                 organization_id: None,
+                target_id: None,
                 email: Some(&user.email),
                 event_type: AuthEventType::RoleGranted,
                 ip_address: None,

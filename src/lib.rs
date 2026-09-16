@@ -11,6 +11,7 @@ use crate::{
     modules::{
         ApiState,
         auth::{admin_router as auth_admin_router, router as auth_router},
+        form::{public_router as form_public_router, router as form_router},
         identity::router as identity_router,
         organization::{admin_router as organization_admin_router, router as organization_router},
     },
@@ -34,18 +35,31 @@ pub fn app(state: AppState) -> anyhow::Result<Router> {
     let administration =
         auth_admin_router(api_state.clone()).merge(organization_admin_router(api_state.clone()));
 
+    // Organizations and their forms share a prefix but live in separate modules, which is what
+    // keeps the dependency running one way: form knows about organization, not the reverse.
+    let organizations =
+        organization_router(api_state.clone()).merge(form_router(api_state.clone()));
+
     let api = Router::new()
         .nest("/auth", auth_router(api_state.clone()))
         .nest("/identity", identity_router(api_state.clone()))
-        .nest("/organizations", organization_router(api_state))
+        .nest("/organizations", organizations)
         .nest("/admin", administration);
 
     // Everything under the API can return or establish a credential.
     let api = security::no_store(api);
+    let api = security::api_cors(api, &state.config)?;
+
+    // The public form endpoints are a different contract: cacheable, open to every origin, and
+    // holding their own tighter budget.
+    let public = form_public_router(api_state);
+    let public = security::public_cors(public);
+    let public = ratelimit::limit(public, state.rate_limiters.submissions.clone());
 
     let mut router = Router::new()
         .route("/health", get(health::health_check))
-        .nest("/api/v1", api);
+        .nest("/api/v1", api)
+        .nest("/f", public);
 
     if state.config.api_docs_enabled {
         // The Swagger UI serves both its own assets and the document at
@@ -55,7 +69,7 @@ pub fn app(state: AppState) -> anyhow::Result<Router> {
         );
     }
 
-    let router = security::harden(router, &state.config)?;
+    let router = security::transport(router, &state.config)?;
     let router = ratelimit::limit(router, state.rate_limiters.global.clone());
 
     Ok(router.layer(TraceLayer::new_for_http()).with_state(state))

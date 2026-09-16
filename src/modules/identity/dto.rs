@@ -217,6 +217,8 @@ pub struct AuditEventResponse {
     pub actor_user_id: Option<Uuid>,
     /// The organization the event concerns, for membership changes.
     pub organization_id: Option<Uuid>,
+    /// The resource the event concerns: a form, a submission, a webhook endpoint.
+    pub target_id: Option<Uuid>,
     pub email: Option<String>,
     pub event_type: AuthEventType,
     /// Source address, without the netmask an `INET` would otherwise carry.
@@ -232,6 +234,7 @@ impl From<AuditEventRecord> for AuditEventResponse {
             user_id: record.user_id,
             actor_user_id: record.actor_user_id,
             organization_id: record.organization_id,
+            target_id: record.target_id,
             email: record.email,
             event_type: record.event_type,
             ip_address: record.ip_address,

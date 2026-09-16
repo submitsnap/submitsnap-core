@@ -514,6 +514,7 @@ impl OrganizationService {
                 user_id: subject_id,
                 actor_user_id: Some(actor_id),
                 organization_id: Some(organization_id),
+                target_id: None,
                 email,
                 event_type,
                 ip_address: client.ip_address,

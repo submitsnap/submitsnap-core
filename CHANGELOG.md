@@ -43,6 +43,11 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 - `access(...)` resolution returning the caller's organization role, with `require_manager` and `require_owner` guards, so authorization cannot be skipped by accident.
 - `auth_events.actor_user_id` and `auth_events.organization_id`, so an administrative action records who did it and to which tenant.
 - Audit event types for organization creation, renaming, deletion, and membership changes, plus the `organization_id` filter on the audit trail.
+- Forms, owned by an organization: definition validation, draft/published/closed lifecycle, per-form submission counting, and a rotatable public handle.
+- `POST`/`GET /organizations/{organization_id}/forms`, `GET`/`PATCH`/`DELETE .../{form_id}`, plus `publish`, `close`, and `public-id` actions.
+- Public `GET`/`POST /f/{public_id}` outside the API prefix, with permissive CORS, a per-form rate limit, honeypot filing, and a payload validator that reports every problem at once.
+- `auth_events.target_id`, so a form lifecycle event names the form it concerns.
+- `SUBMISSION_RATE_LIMIT_PER_MINUTE`, `SUBMISSION_PER_FORM_RATE_LIMIT_PER_MINUTE`, and an optional `S3_BUCKET`.
 
 ### Changed
 

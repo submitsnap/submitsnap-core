@@ -131,14 +131,50 @@ Instance administrators may **read** organizations but never change their member
 
 Instance roles are a table because an operator defines them. Organization roles are a fixed hierarchy the code branches on, so they are an enum on both sides — a `match` over one is exhaustive, and an unknown value cannot reach the code at all.
 
+### Forms
+
+A form belongs to an organization and is addressed internally by its id. What the public sees is a separate, unguessable handle, so a link can be rotated without touching the row.
+
+| Method + path | Required |
+| --- | --- |
+| `POST /organizations/{org}/forms` | owner, admin |
+| `GET /organizations/{org}/forms` | member |
+| `GET /organizations/{org}/forms/{id}` | member |
+| `PATCH /organizations/{org}/forms/{id}` | owner, admin |
+| `DELETE /organizations/{org}/forms/{id}` | owner, admin — cascades its submissions |
+| `POST /organizations/{org}/forms/{id}/publish` | owner, admin |
+| `POST /organizations/{org}/forms/{id}/close` | owner, admin |
+| `POST /organizations/{org}/forms/{id}/public-id` | owner, admin — invalidates the previous link |
+
+A form is a `draft` until it is published. A draft answers `404` on its public handle rather than `403`, so an unfinished form is not discoverable by anybody who guessed the link. Closing is how a form is retired, and it answers `410 Gone` so its audience is told why it stopped working.
+
+Editing the fields bumps `schema_version`, which is stamped on every submission, so answers written against an older field set stay interpretable.
+
+### Public endpoints
+
+These sit at the root, deliberately outside `/api/v1`:
+
+| Method + path | Notes |
+| --- | --- |
+| `GET /f/{public_id}` | The definition to render: title, description, and fields. Never the organization. Briefly cacheable. |
+| `POST /f/{public_id}` | A submission. |
+
+A form is embedded on somebody else's site by design, so three things are true of these routes and not of the API:
+
+- **CORS is open.** The response welcomes any origin, without credentials — a submission genuinely arrives cross-origin, and the API's origin allowlist would refuse it.
+- **They are cacheable.** The blanket `no-store` on the API does not apply here.
+- **They have their own budgets.** A per-caller-IP limit plus a per-form limit, the latter so a flood aimed at one tenant does not consume anybody else's.
+
+A submission is validated against the stored definition and every problem is reported at once, not one at a time. Unknown keys are rejected; keys beginning with `_` are reserved for client-side helpers and dropped. If a honeypot field is filled, the submission is accepted exactly as normal and filed as `spam`, so the bot learns nothing.
+
 ### The scoping rule for tables that come next
 
-Forms, submissions, and everything after them will be owned by an organization. They must follow this shape:
+Forms and submissions follow the shape the organizations work laid down:
 
-- Carry `organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE`. Never nullable, so a query cannot silently span tenants by forgetting a filter.
-- Lead its indexes with `organization_id`, because every read is scoped.
-- Take the organization id as an explicit argument in repository methods rather than reading it from an ambient context, so a missing scope is a compile error rather than a leak.
-- Resolve authorization with one `access(...)` call per handler, so the check cannot be forgotten.
+- `organization_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE`, never nullable, so a query cannot silently span tenants.
+- Indexes lead with `organization_id`. `submissions` goes further: one composite index serves both the per-form listing and the organization-wide inbox, and a GIN index over the answer document makes filtering by *any* field key indexed.
+- Repository methods take the organization id explicitly, so a missing scope is a compile error.
+- One `access(...)` call per handler resolves authorization.
 
 ### Administering an instance
 
@@ -245,6 +281,7 @@ src/modules/
   session/       refresh token families, rotation, and revocation
   rbac/          instance roles and grants
   organization/  tenants, membership, and the access checks over them
+  form/          forms, the definition contract, and public ingestion
 ```
 
 Dependencies flow one way: `auth` depends on `identity` and `session`; `identity` depends on `session` and `rbac`; `organization` depends on `identity`. The shared `ApiState` lives at the module root, so a new route module never has to borrow another module's state to reach the `AuthenticatedUser` extractor.
@@ -264,10 +301,10 @@ A submission must be stored transactionally before any asynchronous work is acce
 ## Roadmap
 
 - [x] Organizations with `owner`, `admin`, and `member` roles
-- [ ] Project, form, and submission model, each scoped to an organization
-- [ ] Public `POST /f/:public_form_id` ingestion endpoint
+- [x] Form model, scoped to an organization, with schema validation and a rotation-able public handle
+- [x] Public `GET`/`POST /f/:public_form_id` ingestion
+- [ ] Submission inbox, status changes, and CSV/JSON export
 - [ ] Transactional outbox and reliable webhook/email delivery
-- [ ] Submission inbox API and data export
 - [ ] JavaScript SDK and React hooks
 - [ ] Dashboard integration
 - [ ] First-party (TOTP) and passkey second factors

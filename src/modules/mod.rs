@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod form;
 pub mod identity;
 pub mod organization;
 pub mod rbac;
@@ -9,7 +10,10 @@ use std::sync::Arc;
 use sqlx::PgPool;
 
 use crate::{
-    modules::{auth::AuthService, identity::IdentityService, organization::OrganizationService},
+    modules::{
+        auth::AuthService, form::FormService, identity::IdentityService,
+        organization::OrganizationService,
+    },
     shared::{config::AppConfig, queue::EmailQueue, ratelimit::RateLimiters},
 };
 
@@ -23,6 +27,7 @@ pub struct ApiState {
     pub auth: Arc<AuthService>,
     pub identity: Arc<IdentityService>,
     pub organizations: Arc<OrganizationService>,
+    pub forms: Arc<FormService>,
     pub config: Arc<AppConfig>,
     pub limiters: RateLimiters,
 }
@@ -46,12 +51,19 @@ impl ApiState {
             database.clone(),
             config.clone(),
         ));
-        let organizations = Arc::new(OrganizationService::new(database, identity.clone()));
+        let organizations = Arc::new(OrganizationService::new(database.clone(), identity.clone()));
+        let forms = Arc::new(FormService::new(
+            database,
+            organizations.clone(),
+            limiters.submissions_per_form.clone(),
+            config.file_uploads_enabled(),
+        ));
 
         Ok(Self {
             auth,
             identity,
             organizations,
+            forms,
             config,
             limiters,
         })

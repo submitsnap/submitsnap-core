@@ -28,6 +28,13 @@ pub struct AppConfig {
     /// single-use token (password reset, email verification).
     #[serde(default = "default_sensitive_rate_limit_per_hour")]
     pub sensitive_rate_limit_per_hour: u32,
+    /// Per-IP budget for public form submissions.
+    #[serde(default = "default_submission_rate_limit_per_minute")]
+    pub submission_rate_limit_per_minute: u32,
+    /// Per-form budget, which is what protects one tenant from a flood aimed at a single form
+    /// regardless of where it comes from.
+    #[serde(default = "default_submission_per_form_rate_limit_per_minute")]
+    pub submission_per_form_rate_limit_per_minute: u32,
     #[serde(default)]
     pub cookie_secure: bool,
     #[serde(default = "default_access_token_ttl_seconds")]
@@ -77,6 +84,11 @@ pub struct AppConfig {
     /// `starttls` (port 587), `implicit` (port 465), or `none`.
     #[serde(default = "default_smtp_tls_mode")]
     pub smtp_tls_mode: String,
+
+    /// Set to enable file uploads. Storage is optional: without it the product works fully,
+    /// except that a form containing a file field cannot be published.
+    #[serde(default)]
+    pub s3_bucket: Option<String>,
 }
 
 /// The subset of configuration the email adapters require. Plain data: it is derived from
@@ -134,6 +146,12 @@ impl AppConfig {
         }
         if self.sensitive_rate_limit_per_hour == 0 {
             invalid.push("SENSITIVE_RATE_LIMIT_PER_HOUR must be greater than zero");
+        }
+        if self.submission_rate_limit_per_minute == 0 {
+            invalid.push("SUBMISSION_RATE_LIMIT_PER_MINUTE must be greater than zero");
+        }
+        if self.submission_per_form_rate_limit_per_minute == 0 {
+            invalid.push("SUBMISSION_PER_FORM_RATE_LIMIT_PER_MINUTE must be greater than zero");
         }
         if self.access_token_ttl_seconds == 0 {
             invalid.push("ACCESS_TOKEN_TTL_SECONDS must be greater than zero");
@@ -219,6 +237,13 @@ impl AppConfig {
 
     pub fn uses_smtp(&self) -> bool {
         self.email_provider.trim().eq_ignore_ascii_case("smtp")
+    }
+
+    /// Whether file uploads are available. Storage is deliberately optional.
+    pub fn file_uploads_enabled(&self) -> bool {
+        self.s3_bucket
+            .as_deref()
+            .is_some_and(|bucket| !bucket.trim().is_empty())
     }
 
     /// Emits [`Self::deployment_warnings`] through the tracing subscriber. Never fails: a
@@ -329,6 +354,13 @@ fn default_register_rate_limit_per_hour() -> u32 {
 }
 fn default_sensitive_rate_limit_per_hour() -> u32 {
     5
+}
+
+fn default_submission_rate_limit_per_minute() -> u32 {
+    30
+}
+fn default_submission_per_form_rate_limit_per_minute() -> u32 {
+    120
 }
 
 fn default_access_token_ttl_seconds() -> u64 {

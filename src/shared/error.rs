@@ -20,6 +20,9 @@ pub enum AppError {
     Forbidden,
     #[error("resource not found")]
     NotFound,
+    /// The resource exists but is deliberately not serving: a closed form, for instance.
+    #[error("{0}")]
+    Gone(String),
     #[error("resource already exists")]
     Conflict,
     #[error("account is locked")]
@@ -46,6 +49,7 @@ impl AppError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Gone(_) => StatusCode::GONE,
             Self::Conflict => StatusCode::CONFLICT,
             Self::AccountLocked => StatusCode::LOCKED,
             Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
@@ -60,6 +64,7 @@ impl AppError {
             Self::Unauthorized => "authentication_failed",
             Self::Forbidden => "forbidden",
             Self::NotFound => "not_found",
+            Self::Gone(_) => "gone",
             Self::Conflict => "conflict",
             Self::AccountLocked => "account_locked",
             Self::TooManyRequests => "too_many_requests",

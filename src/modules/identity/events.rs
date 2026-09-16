@@ -34,6 +34,12 @@ pub enum AuthEventType {
     OrganizationMemberAdded,
     OrganizationMemberRoleChanged,
     OrganizationMemberRemoved,
+    FormCreated,
+    FormUpdated,
+    FormPublished,
+    FormClosed,
+    FormDeleted,
+    FormPublicIdRotated,
 }
 
 /// An audit record to append. Borrowed fields keep the call sites cheap.
@@ -46,6 +52,9 @@ pub struct AuthEvent<'a> {
     pub actor_user_id: Option<Uuid>,
     /// Set for events that concern an organization's membership.
     pub organization_id: Option<Uuid>,
+    /// The resource the event concerns: a form, a submission, a webhook endpoint. No foreign
+    /// key, because the trail has to outlive what it describes.
+    pub target_id: Option<Uuid>,
     /// Attempted email address. Recorded for failed logins so credential-stuffing campaigns
     /// can be investigated; it is personal data covered by the retention policy.
     pub email: Option<&'a str>,
@@ -60,6 +69,7 @@ pub struct AuditEventRecord {
     pub user_id: Option<Uuid>,
     pub actor_user_id: Option<Uuid>,
     pub organization_id: Option<Uuid>,
+    pub target_id: Option<Uuid>,
     pub email: Option<String>,
     pub event_type: AuthEventType,
     /// Selected through `host()` so the value is a bare address rather than the `INET` text
@@ -128,12 +138,14 @@ impl AuthEventRepository {
     pub async fn record(&self, event: AuthEvent<'_>) {
         let result = sqlx::query(
             "INSERT INTO auth_events \
-                 (user_id, actor_user_id, organization_id, email, event_type, ip_address, user_agent) \
-             VALUES ($1, $2, $3, $4, $5, $6::inet, $7)",
+                 (user_id, actor_user_id, organization_id, target_id, email, event_type, \
+                  ip_address, user_agent) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7::inet, $8)",
         )
         .bind(event.user_id)
         .bind(event.actor_user_id)
         .bind(event.organization_id)
+        .bind(event.target_id)
         .bind(event.email)
         .bind(event.event_type)
         .bind(event.ip_address.map(|address| address.to_string()))
@@ -158,7 +170,7 @@ impl AuthEventRepository {
         offset: i64,
     ) -> Result<Vec<AuditEventRecord>, sqlx::Error> {
         sqlx::query_as::<_, AuditEventRecord>(&format!(
-            "SELECT id, user_id, actor_user_id, organization_id, email, event_type, \
+            "SELECT id, user_id, actor_user_id, organization_id, target_id, email, event_type, \
                     host(ip_address) AS ip_address, user_agent, created_at \
              FROM auth_events {AUDIT_FILTERS} \
              ORDER BY created_at DESC, id DESC LIMIT $7 OFFSET $8"
